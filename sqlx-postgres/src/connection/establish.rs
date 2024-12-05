@@ -1,5 +1,3 @@
-use crate::HashMap;
-
 use crate::common::StatementCache;
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
@@ -145,9 +143,7 @@ impl PgConnection {
                 pending_ready_for_query_count: 0,
                 next_statement_id: StatementId::NAMED_START,
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
-                cache_type_oid: HashMap::new(),
-                cache_type_info: HashMap::new(),
-                cache_elem_type_to_array: HashMap::new(),
+                type_cache: options.type_cache.clone(),
                 log_settings: options.log_settings.clone(),
             }),
         })
