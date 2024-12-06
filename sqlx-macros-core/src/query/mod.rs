@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::{fs, io};
 
-use once_cell::sync::Lazy;
 use proc_macro2::TokenStream;
+use std::sync::LazyLock;
 use syn::Type;
 
 pub use input::QueryMacroInput;
@@ -108,7 +108,7 @@ impl Metadata {
 
 // If we are in a workspace, lookup `workspace_root` since `CARGO_MANIFEST_DIR` won't
 // reflect the workspace dir: https://github.com/rust-lang/cargo/issues/3946
-static METADATA: Lazy<Metadata> = Lazy::new(|| {
+static METADATA: LazyLock<Metadata> = LazyLock::new(|| {
     let manifest_dir: PathBuf = env("CARGO_MANIFEST_DIR")
         .expect("`CARGO_MANIFEST_DIR` must be set")
         .into();

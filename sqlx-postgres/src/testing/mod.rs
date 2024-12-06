@@ -2,11 +2,10 @@ use std::fmt::Write;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use futures_core::future::BoxFuture;
-
-use once_cell::sync::OnceCell;
 
 use crate::connection::Connection;
 
@@ -19,8 +18,8 @@ use crate::{PgConnectOptions, PgConnection, Postgres};
 
 pub(crate) use sqlx_core::testing::*;
 
-// Using a blocking `OnceCell` here because the critical sections are short.
-static MASTER_POOL: OnceCell<Pool<Postgres>> = OnceCell::new();
+// Using a blocking `OnceLock` here because the critical sections are short.
+static MASTER_POOL: OnceLock<Pool<Postgres>> = OnceLock::new();
 // Automatically delete any databases created before the start of the test binary.
 static DO_CLEANUP: AtomicBool = AtomicBool::new(true);
 
