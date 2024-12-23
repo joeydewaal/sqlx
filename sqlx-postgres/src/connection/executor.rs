@@ -16,8 +16,11 @@ use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_core::Stream;
 use futures_util::{pin_mut, TryStreamExt};
+use once_cell::sync::Lazy;
 use sqlx_core::arguments::Arguments;
-use sqlx_core::Either;
+use sqlx_core::{Either, HashMap};
+use sqlx_nullable::{NullableState, Source, SqlFlavour, Table};
+use std::sync::Mutex;
 use std::{borrow::Cow, sync::Arc};
 
 async fn prepare(
@@ -470,7 +473,19 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
 
             let (stmt_id, metadata) = self.get_or_prepare(sql, &[], true, None).await?;
 
-            let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;
+            let source = fetch_source(self).await?;
+
+            let cols: Vec<&str> = metadata
+                .columns
+                .iter()
+                .map(|col| col.name.as_str())
+                .collect();
+
+            let nullable = NullableState::new(sql, source, SqlFlavour::Postgres)
+                .get_nullable(&cols)
+                .into_iter()
+                .map(|nullable| Some(nullable))
+                .collect();
 
             Ok(Describe {
                 columns: metadata.columns.clone(),
@@ -479,4 +494,44 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
             })
         })
     }
+}
+
+static SOURCES: Lazy<Mutex<HashMap<u32, Source>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+async fn fetch_source(connection: &mut PgConnection) -> Result<Source, Error> {
+    if let Some(source) = SOURCES.lock().unwrap().get(&connection.inner.process_id) {
+        return Ok(source.clone());
+    };
+
+    let tables: Vec<_> = sqlx_core::query_as::query_as::<_, (String, Vec<(String, bool)>)>(
+        "
+select
+    t.table_name,
+    array_agg((c.column_name::text, c.is_nullable::bool)) as columns
+from
+    information_schema.tables t
+inner join information_schema.columns c on
+    t.table_name = c.table_name
+group by t.table_name",
+    )
+    .fetch_all(&mut *connection)
+    .await?
+    .into_iter()
+    .map(|row| {
+        let mut table = Table::new(&*row.0);
+        for col in row.1 {
+            table = table.push_column(col.0, col.1);
+        }
+        table
+    })
+    .collect();
+
+    let source = Source::new(tables);
+
+    SOURCES
+        .lock()
+        .unwrap()
+        .insert(connection.inner.process_id, source.clone());
+
+    Ok(source)
 }

@@ -1,0 +1,15 @@
+[package]
+name = "sqlx-nullable"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "sqlx_nullable"
+path = "src/lib.rs"
+
+[dependencies]
+sqlparser = "0.51"
+anyhow = "1"

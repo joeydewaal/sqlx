@@ -3482,6 +3482,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlparser"
+version = "0.51.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fe11944a61da0da3f592e19a45ebe5ab92dc14a779907ff1f08fbb797bfefc7"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "sqlx"
 version = "0.8.2"
 dependencies = [
@@ -3794,6 +3803,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sqlx-nullable"
+version = "0.8.2"
+dependencies = [
+ "anyhow",
+ "sqlparser",
+]
+
+[[package]]
 name = "sqlx-postgres"
 version = "0.8.2"
 dependencies = [
@@ -3830,6 +3847,7 @@ dependencies = [
  "smallvec",
  "sqlx",
  "sqlx-core",
+ "sqlx-nullable",
  "stringprep",
  "thiserror 2.0.0",
  "time",

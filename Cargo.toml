@@ -10,6 +10,7 @@ members = [
     "sqlx-mysql",
     "sqlx-postgres",
     "sqlx-sqlite",
+    "sqlx-nullable",
     "examples/mysql/todos",
     "examples/postgres/axum-social-with-tests",
     "examples/postgres/chat",
@@ -132,6 +133,8 @@ sqlx-macros = { version = "=0.8.2", path = "sqlx-macros" }
 sqlx-mysql = { version = "=0.8.2", path = "sqlx-mysql" }
 sqlx-postgres = { version = "=0.8.2", path = "sqlx-postgres" }
 sqlx-sqlite = { version = "=0.8.2", path = "sqlx-sqlite" }
+
+sqlx-nullable = { version = "=0.8.2", path = "sqlx-nullable"}
 
 # Facade crate (for reference from sqlx-cli)
 sqlx = { version = "=0.8.2", path = ".", default-features = false }

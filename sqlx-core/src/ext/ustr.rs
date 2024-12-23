@@ -25,6 +25,13 @@ impl UStr {
             UStr::Shared(s) => s.strip_prefix(prefix).map(|s| Self::Shared(s.into())),
         }
     }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            UStr::Static(s) => s,
+            UStr::Shared(s) => s
+        }
+    }
 }
 
 impl Deref for UStr {
