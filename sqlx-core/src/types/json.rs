@@ -136,12 +136,16 @@ impl<'a, T: 'a> Json<T>
 where
     T: Deserialize<'a>,
 {
+    fn map_json_error(error: serde_json::Error) -> BoxDynError {
+        format!("JSON error: {}", error.to_string()).into()
+    }
+
     pub fn decode_from_string(s: &'a str) -> Result<Self, BoxDynError> {
-        serde_json::from_str(s).map_err(Into::into)
+        serde_json::from_str(s).map_err(Self::map_json_error)
     }
 
     pub fn decode_from_bytes(bytes: &'a [u8]) -> Result<Self, BoxDynError> {
-        serde_json::from_slice(bytes).map_err(Into::into)
+        serde_json::from_slice(bytes).map_err(Self::map_json_error)
     }
 }
 

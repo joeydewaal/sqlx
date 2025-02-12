@@ -94,6 +94,6 @@ where
             buf = &buf[1..];
         }
 
-        serde_json::from_slice(buf).map(Json).map_err(Into::into)
+        Json::decode_from_bytes(buf)
     }
 }
