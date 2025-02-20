@@ -188,19 +188,31 @@ impl PgConnection {
         // println!("prepare {parameters:?} {metadata:?}");
         let statement = prepare(self, sql, parameters, metadata).await?;
 
-        if store_to_cache && self.inner.cache_statement.is_enabled() {
-            if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
-                self.inner.stream.write_msg(Close::Statement(id))?;
-                self.write_sync();
+        if store_to_cache {
+            self.store_to_cache(sql, statement.clone())?;
+            self.inner.stream.flush().await?;
 
-                self.inner.stream.flush().await?;
-
-                self.wait_for_close_complete(1).await?;
-                self.recv_ready_for_query().await?;
-            }
+            self.wait_for_close_complete(1).await?;
+            self.recv_ready_for_query().await?;
         }
 
         Ok(statement)
+    }
+
+    // Stores prepared statement to cache and removes LRU
+    // Does not do any I/O
+    pub(crate) fn store_to_cache(
+        &mut self,
+        sql: &str,
+        stmt: (StatementId, Arc<PgStatementMetadata>),
+    ) -> sqlx_core::Result<()> {
+        if self.inner.cache_statement.is_enabled() {
+            if let Some((id, _)) = self.inner.cache_statement.insert(sql, stmt.clone()) {
+                self.inner.stream.write_msg(Close::Statement(id))?;
+                self.write_sync();
+            }
+        }
+        Ok(())
     }
 
     pub(crate) async fn run<'e, 'c: 'e, 'q: 'e>(

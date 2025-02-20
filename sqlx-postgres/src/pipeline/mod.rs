@@ -12,8 +12,8 @@ use sqlx_core::{
 };
 use state::{PipelineState, QueryState};
 
-mod state;
 mod cache;
+mod state;
 // Parse -> Bind -> Execute -> Close
 
 // -- Create prepared statement --
@@ -62,7 +62,7 @@ impl<C: DerefMut<Target = PgConnection>> Pipeline<C> {
             inner: Mutex::new(Some(MutabableInner {
                 conn,
                 queries: Vec::new(),
-                state: PipelineState::new()
+                state: PipelineState::new(),
             })),
         }
     }
@@ -80,7 +80,7 @@ impl<C: DerefMut<Target = PgConnection>> Pipeline<C> {
 struct MutabableInner<C: DerefMut<Target = PgConnection>> {
     conn: C,
     queries: Vec<QueryState>,
-    state: PipelineState
+    state: PipelineState,
 }
 
 impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
@@ -109,15 +109,12 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
         loop {
             let mut all_done = true;
             let mut has_flushed = false;
-            let mut i: u128 = 0;
             for query in &mut self.queries {
-                // println!("---- {i} {}", query.is_done);
                 if query.is_done {
                     continue;
                 } else {
                     all_done = false;
                 }
-                i += 1;
                 if query.should_flush_before_next {
                     if !has_flushed {
                         // println!("is flushing");
@@ -127,7 +124,14 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
 
                     query.should_flush_before_next = false;
                 }
-                query.next(conn, &mut self.state).await?;
+                let result = query.next(conn, &mut self.state).await;
+                if let Err(result) = result {
+                    query.handle_error(&mut self.state, conn).await?;
+                    // panic!("{result}");
+                    query.is_done = true;
+                    dbg!(&result);
+                    let _ = query.sender.send(Some(Err(result)));
+                }
             }
 
             if all_done {
@@ -199,8 +203,8 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
         Box::pin(async move {
             let mut ret = None;
             while let Ok(Some(result)) = rx.recv_async().await {
-                match result {
-                    Ok(Either::Right(r)) if ret.is_none() => ret = Some(r),
+                match result? {
+                    Either::Right(r) if ret.is_none() => ret = Some(r),
                     _ => {}
                 }
             }
