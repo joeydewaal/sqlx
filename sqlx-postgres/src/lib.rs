@@ -24,6 +24,7 @@ mod type_checking;
 mod type_info;
 pub mod types;
 mod value;
+mod pipeline;
 
 #[cfg(feature = "any")]
 // We are hiding the any module with its AnyConnectionBackend trait
@@ -62,6 +63,7 @@ pub use transaction::PgTransactionManager;
 pub use type_info::{PgTypeInfo, PgTypeKind};
 pub use types::PgHasArrayType;
 pub use value::{PgValue, PgValueFormat, PgValueRef};
+pub use pipeline::Pipeline;
 
 /// An alias for [`Pool`][crate::pool::Pool], specialized for Postgres.
 pub type PgPool = crate::pool::Pool<Postgres>;

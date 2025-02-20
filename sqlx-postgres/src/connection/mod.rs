@@ -52,15 +52,15 @@ pub struct PgConnectionInner {
 
     // sequence of statement IDs for use in preparing statements
     // in PostgreSQL, the statement is prepared to a user-supplied identifier
-    next_statement_id: StatementId,
+    pub next_statement_id: StatementId,
 
     // cache statement by query string to the id and columns
     cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
 
     // cache user-defined types by id <-> info
-    cache_type_info: HashMap<Oid, PgTypeInfo>,
-    cache_type_oid: HashMap<UStr, Oid>,
-    cache_elem_type_to_array: HashMap<Oid, Oid>,
+    pub(crate) cache_type_info: HashMap<Oid, PgTypeInfo>,
+    pub(crate) cache_type_oid: HashMap<UStr, Oid>,
+    pub(crate) cache_elem_type_to_array: HashMap<Oid, Oid>,
 
     // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,
@@ -95,7 +95,7 @@ impl PgConnection {
         Ok(())
     }
 
-    async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
+    pub(crate) async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
         let r: ReadyForQuery = self.inner.stream.recv_expect().await?;
 
         self.inner.pending_ready_for_query_count -= 1;
@@ -105,7 +105,7 @@ impl PgConnection {
     }
 
     #[inline(always)]
-    fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
+    pub fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
         self.inner.pending_ready_for_query_count = self
             .inner
             .pending_ready_for_query_count

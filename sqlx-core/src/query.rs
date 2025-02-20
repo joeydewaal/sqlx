@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::marker::PhantomData;
 
 use either::Either;
@@ -287,13 +288,16 @@ where
     ///
     /// Otherwise, you might want to add `LIMIT 1` to your query.
     #[inline]
-    pub async fn fetch_optional<'e, 'c: 'e, E>(self, executor: E) -> Result<Option<DB::Row>, Error>
+    pub fn fetch_optional<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<Option<DB::Row>, Error>> + 'e
     where
         'q: 'e,
         A: 'e,
         E: Executor<'c, Database = DB>,
     {
-        executor.fetch_optional(self).await
+        executor.fetch_optional(self)
     }
 }
 

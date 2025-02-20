@@ -31,6 +31,8 @@ futures-channel = { version = "0.3.19", default-features = false, features = ["s
 futures-core = { version = "0.3.19", default-features = false }
 futures-util = { version = "0.3.19", default-features = false, features = ["alloc", "sink", "io"] }
 
+flume = { version = "0.11.0", default-features = false, features = ["async"] }
+
 # Cryptographic Primitives
 crc = "3.0.0"
 hkdf = "0.12.0"

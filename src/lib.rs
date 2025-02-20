@@ -53,7 +53,7 @@ pub use sqlx_mysql::{
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 #[doc(inline)]
 pub use sqlx_postgres::{
-    self as postgres, PgConnection, PgExecutor, PgPool, PgTransaction, Postgres,
+    self as postgres, PgConnection, PgExecutor, PgPool, PgTransaction, Postgres
 };
 
 #[cfg(feature = "_sqlite")]

@@ -97,7 +97,7 @@ impl TryFrom<i8> for TypCategory {
 }
 
 impl PgConnection {
-    pub(super) async fn handle_row_description(
+    pub(crate) async fn handle_row_description(
         &mut self,
         desc: Option<RowDescription>,
         should_fetch: bool,
@@ -137,7 +137,7 @@ impl PgConnection {
         Ok((columns, column_names))
     }
 
-    pub(super) async fn handle_parameter_description(
+    pub(crate) async fn handle_parameter_description(
         &mut self,
         desc: ParameterDescription,
     ) -> Result<Vec<PgTypeInfo>, Error> {
@@ -191,6 +191,7 @@ impl PgConnection {
     }
 
     async fn fetch_type_by_oid(&mut self, oid: Oid) -> Result<PgTypeInfo, Error> {
+        println!("fetching");
         let (name, typ_type, category, relation_id, element, base_type): (
             String,
             i8,

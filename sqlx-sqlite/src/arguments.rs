@@ -122,6 +122,7 @@ impl SqliteArguments<'_> {
 
 impl SqliteArgumentValue<'_> {
     fn into_static(self) -> SqliteArgumentValue<'static> {
+        println!("Making static");
         use SqliteArgumentValue::*;
 
         match self {

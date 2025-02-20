@@ -43,6 +43,14 @@ async fn prepare(
     conn.wait_until_ready().await?;
 
     // next we send the PARSE command to the server
+    // println!(
+    //     "Parse {{
+    //     {param_types:?},
+    //     {sql:?}
+    //     {id:?}
+    // }}
+    // "
+    // );
     conn.inner.stream.write_msg(Parse {
         param_types: &param_types,
         query: sql,
@@ -50,6 +58,7 @@ async fn prepare(
     })?;
 
     if metadata.is_none() {
+        // println!("Describe {id:?}");
         // get the statement columns and parameters
         conn.inner
             .stream
@@ -91,6 +100,8 @@ async fn prepare(
             column_names: Arc::new(column_names),
         })
     };
+
+    // println!("Metadata: {metadata:?}");
 
     Ok((id, metadata))
 }
@@ -173,6 +184,7 @@ impl PgConnection {
             return Ok((*statement).clone());
         }
 
+        // println!("prepare {parameters:?} {metadata:?}");
         let statement = prepare(self, sql, parameters, metadata).await?;
 
         if store_to_cache && self.inner.cache_statement.is_enabled() {
@@ -201,6 +213,7 @@ impl PgConnection {
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
 
         // before we continue, wait until we are "ready" to accept more queries
+        // println!("Waiting until ready");
         self.wait_until_ready().await?;
 
         let mut metadata: Arc<PgStatementMetadata>;
@@ -221,6 +234,7 @@ impl PgConnection {
 
             // prepare the statement if this our first time executing it
             // always return the statement ID here
+            // println!("get_or_prepare");
             let (statement, metadata_) = self
                 .get_or_prepare(query, &arguments.types, persistent, metadata_opt)
                 .await?;

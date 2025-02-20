@@ -127,8 +127,12 @@ impl PgArguments {
         }
 
         for (offset, kind) in type_holes {
+            println!("fetching");
             let oid = match kind {
-                HoleKind::Type { name } => conn.fetch_type_id_by_name(name).await?,
+                HoleKind::Type { name } => {
+                    println!("fetching");
+                    conn.fetch_type_id_by_name(name).await?
+                }
                 HoleKind::Array(array) => conn.fetch_array_type_id(array).await?,
             };
             buffer[*offset..(*offset + 4)].copy_from_slice(&oid.0.to_be_bytes());
