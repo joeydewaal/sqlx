@@ -55,7 +55,7 @@ pub struct PgConnectionInner {
     pub next_statement_id: StatementId,
 
     // cache statement by query string to the id and columns
-    cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
+    pub(crate) cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
 
     // cache user-defined types by id <-> info
     pub(crate) cache_type_info: HashMap<Oid, PgTypeInfo>,

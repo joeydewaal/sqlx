@@ -1,9 +1,4 @@
-use crate::{
-    describe::Describe,
-    message::{self, Parse},
-    types::Oid,
-    PgArguments,
-};
+use crate::{describe::Describe, message::Parse, types::Oid};
 use std::{
     fmt::Debug,
     ops::DerefMut,
@@ -12,11 +7,10 @@ use std::{
 
 use futures_core::{future::BoxFuture, stream::BoxStream};
 use sqlx_core::{
-    error::BoxDynError,
     executor::{Execute, Executor},
     Either, Error,
 };
-use state::PipelineState;
+use state::{PipelineState, QueryState};
 
 mod state;
 // Parse -> Bind -> Execute -> Close
@@ -67,6 +61,7 @@ impl<C: DerefMut<Target = PgConnection>> Pipeline<C> {
             inner: Mutex::new(Some(MutabableInner {
                 conn,
                 queries: Vec::new(),
+                state: PipelineState::new()
             })),
         }
     }
@@ -83,7 +78,8 @@ impl<C: DerefMut<Target = PgConnection>> Pipeline<C> {
 
 struct MutabableInner<C: DerefMut<Target = PgConnection>> {
     conn: C,
-    queries: Vec<PipelineState>,
+    queries: Vec<QueryState>,
+    state: PipelineState
 }
 
 impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
@@ -93,8 +89,8 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
     ) -> flume::Receiver<Result<Either<PgQueryResult, PgRow>, Error>> {
         let (tx, rx) = flume::unbounded();
         let args = query.take_arguments();
-        let execute = PipelineState {
-            next_step: state::PipelineStep::ParseDescribe,
+        let execute = QueryState {
+            next_step: state::PipelineStep::GetOrPrepare,
             is_done: false,
             sql: query.sql().to_string(),
             arguments: args.unwrap().unwrap(),
@@ -130,7 +126,7 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
 
                     query.should_flush_before_next = false;
                 }
-                query.next(conn).await?;
+                query.next(conn, &mut self.state).await?;
             }
 
             if all_done {

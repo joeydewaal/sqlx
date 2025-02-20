@@ -133,7 +133,7 @@ async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription
 
 impl PgConnection {
     // wait for CloseComplete to indicate a statement was closed
-    pub(super) async fn wait_for_close_complete(&mut self, mut count: usize) -> Result<(), Error> {
+    pub(crate) async fn wait_for_close_complete(&mut self, mut count: usize) -> Result<(), Error> {
         // we need to wait for the [CloseComplete] to be returned from the server
         while count > 0 {
             match self.inner.stream.recv().await? {

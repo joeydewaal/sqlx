@@ -122,6 +122,7 @@ impl PgArguments {
         for patch in patches {
             let buf = &mut buffer[patch.buf_offset..];
             let ty = &parameters[patch.arg_index];
+            println!("PATCH: {ty:?}");
 
             (patch.callback)(buf, ty);
         }

@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use sqlx_core::{arguments::Arguments, Either, Error};
 
@@ -11,25 +11,45 @@ use crate::{
     statement::PgStatementMetadata,
     type_info::PgType,
     types::Oid,
-    PgArguments, PgConnection, PgQueryResult, PgRow, PgValueFormat,
+    PgArguments, PgConnection, PgQueryResult, PgRow, PgTypeInfo, PgValueFormat,
 };
 
 pub struct PipelineState {
+    preparing: HashSet<String>,
+}
+
+impl PipelineState {
+    pub fn new() -> Self {
+        Self {
+            preparing: HashSet::new(),
+        }
+    }
+}
+
+pub struct QueryState {
     pub next_step: PipelineStep,
     pub sql: String,
     pub arguments: PgArguments,
     pub should_flush_before_next: bool,
     pub sender: flume::Sender<Result<Either<PgQueryResult, PgRow>, Error>>,
-    pub is_done: bool
+    pub is_done: bool,
 }
 
 pub enum PipelineStep {
+    GetOrPrepare,
     ParseDescribe,
     ReceiveParseDescribe(StatementId),
-    ApplyPatch(StatementId, Arc<PgStatementMetadata>),
     BindExecuteClose(StatementId, Arc<PgStatementMetadata>),
     ReceiveData(Arc<PgStatementMetadata>),
     FillCache(Box<PipelineStep>),
+}
+
+fn get_pg_type(oid: Oid, conn: &PgConnection) -> Option<PgTypeInfo> {
+    if let Some(t) = PgTypeInfo::try_from_oid(oid) {
+        return Some(t);
+    } else {
+        conn.inner.cache_type_info.get(&oid).cloned()
+    }
 }
 
 fn get_oid(ty: &PgType, conn: &PgConnection) -> Option<Oid> {
@@ -49,26 +69,58 @@ fn get_oid(ty: &PgType, conn: &PgConnection) -> Option<Oid> {
     }
 }
 
-impl PipelineState {
-    pub async fn next(&mut self, conn: &mut PgConnection) -> sqlx_core::Result<()> {
+impl QueryState {
+    pub async fn next(
+        &mut self,
+        conn: &mut PgConnection,
+        state: &mut PipelineState,
+    ) -> sqlx_core::Result<()> {
         self.next_step = match &self.next_step {
+            PipelineStep::GetOrPrepare => {
+                // dbg!(&conn.inner.cache_statement);
+                if let Some((statement_id, metadata)) =
+                    conn.inner.cache_statement.get_mut(&self.sql)
+                {
+                    // println!("Got cached");
+                    PipelineStep::BindExecuteClose(*statement_id, metadata.clone())
+                } else {
+                    if state.preparing.contains(&self.sql) {
+                        // println!("Is already preqaring stmt");
+                        PipelineStep::GetOrPrepare
+                    } else {
+                        // println!("Preparing");
+                        state.preparing.insert(self.sql.clone());
+                        PipelineStep::ParseDescribe
+                    }
+                }
+            }
             PipelineStep::ParseDescribe => {
                 let id = conn.inner.next_statement_id;
                 conn.inner.next_statement_id = id.next();
 
                 let mut oids = Vec::new();
+                let mut argument_types = Vec::new();
 
                 for ty in &self.arguments.types {
+                    println!("Got: {ty:?}");
                     if let Some(oid) = get_oid(&ty.0, conn) {
+                        if let Some(ty) = get_pg_type(oid, conn) {
+                            println!("Wanted: {ty:?}");
+                            argument_types.push(ty);
+                        } else {
+                            unimplemented!("Could not resolv OID {:?}", oid);
+                        }
+
                         oids.push(oid);
                     } else {
-                        // Eagerly fill cache
-                        // Make sure we get back when the cache is full
-                        self.next_step =
-                            PipelineStep::FillCache(Box::new(PipelineStep::ParseDescribe));
+                        unimplemented!("Could not resolve pg type: {ty:?}");
                     }
                 }
 
+                let r = conn.inner.cache_type_info.get(&oids[0]);
+                // dbg!(&r);
+
+                // dbg!(&oids);
                 // println!("Pushing Parse");
                 conn.inner.stream.write_msg(Parse {
                     param_types: &oids,
@@ -83,24 +135,21 @@ impl PipelineState {
 
                 conn.write_sync();
 
+                self.arguments.apply_patches(conn, &argument_types).await?;
+
                 self.should_flush_before_next = true;
                 PipelineStep::ReceiveParseDescribe(id)
             }
             PipelineStep::ReceiveParseDescribe(statement_id) => {
-                // println!("Expect `ParseComplete`");
                 conn.inner.stream.recv_expect::<ParseComplete>().await?;
-                // println!("Received ParseComplete");
                 let parameters = recv_desc_params(conn).await?;
-                // println!("Received recv_desc_params");
 
                 let rows = recv_desc_rows(conn).await?;
-                // println!("got rows");
 
                 // each SYNC produces one READY FOR QUERY
                 // conn.recv_ready_for_query().await?;
 
                 let parameters = conn.handle_parameter_description(parameters).await?;
-                // println!("Handled parameter_description");
 
                 let (columns, column_names) = conn.handle_row_description(rows, true).await?;
 
@@ -114,14 +163,19 @@ impl PipelineState {
                     columns,
                     column_names: Arc::new(column_names),
                 });
-                PipelineStep::ApplyPatch(*statement_id, metadata)
-            }
-            PipelineStep::ApplyPatch(statment_id, param) => {
-                // println!("ApplyPatch");
-                self.arguments
-                    .apply_patches(conn, &param.parameters)
-                    .await?;
-                PipelineStep::BindExecuteClose(*statment_id, param.clone())
+
+                if conn.inner.cache_statement.is_enabled() {
+                    if let Some((_, _)) = conn
+                        .inner
+                        .cache_statement
+                        .insert(&self.sql, (*statement_id, metadata.clone()))
+                    {
+                        // TODO
+                    }
+                }
+                state.preparing.remove(&self.sql);
+
+                PipelineStep::BindExecuteClose(*statement_id, metadata)
             }
             PipelineStep::BindExecuteClose(statement_id, param) => {
                 // dbg!(&statement_id, param);
@@ -149,10 +203,8 @@ impl PipelineState {
                 PipelineStep::ReceiveData(param.clone())
             }
             PipelineStep::ReceiveData(metadata) => {
-                // println!("ReceiveData");
                 loop {
                     let message = conn.inner.stream.recv().await?;
-                    // println!("Got");
 
                     match message.format {
                     BackendMessageFormat::BindComplete
@@ -175,9 +227,11 @@ impl PipelineState {
 
                         let rows_affected = cc.rows_affected();
                         // logger.increase_rows_affected(rows_affected);
-                        self.sender.send(Ok(Either::Left(PgQueryResult {
+                        if self.sender.send(Ok(Either::Left(PgQueryResult {
                             rows_affected,
-                        })));
+                        }))).is_err() {
+                            return Ok(());
+                        };
                     }
 
                     BackendMessageFormat::EmptyQueryResponse => {
@@ -203,7 +257,6 @@ impl PipelineState {
                     }
 
                     BackendMessageFormat::DataRow => {
-                        // println!("Got data");
                         // logger.increment_rows_returned();
 
                         // one of the set of rows returned by a SELECT, FETCH, etc query
@@ -231,7 +284,6 @@ impl PipelineState {
                     }
                 }
                 }
-                // println!("is done");
                 self.is_done = true;
                 return Ok(());
             }
