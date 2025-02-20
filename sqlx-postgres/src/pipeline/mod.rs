@@ -1,4 +1,4 @@
-use crate::{describe::Describe, message::Parse, types::Oid};
+use crate::describe::Describe;
 use std::{
     fmt::Debug,
     ops::DerefMut,
@@ -6,13 +6,15 @@ use std::{
 };
 
 use futures_core::{future::BoxFuture, stream::BoxStream};
+use manager::PipelineManager;
 use sqlx_core::{
     executor::{Execute, Executor},
     Either, Error,
 };
-use state::{PipelineState, QueryState};
+use state::PipelineState;
 
 mod cache;
+mod manager;
 mod state;
 // Parse -> Bind -> Execute -> Close
 
@@ -47,7 +49,7 @@ mod state;
 use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
 
 pub struct Pipeline<C: DerefMut<Target = PgConnection>> {
-    inner: Mutex<Option<MutabableInner<C>>>,
+    inner: Mutex<Option<PipelineManager<C>>>,
 }
 
 impl<C: Debug + DerefMut<Target = PgConnection>> Debug for Pipeline<C> {
@@ -59,115 +61,17 @@ impl<C: Debug + DerefMut<Target = PgConnection>> Debug for Pipeline<C> {
 impl<C: DerefMut<Target = PgConnection>> Pipeline<C> {
     pub fn new(conn: C) -> Self {
         Self {
-            inner: Mutex::new(Some(MutabableInner {
-                conn,
-                queries: Vec::new(),
-                state: PipelineState::new(),
-            })),
+            inner: Mutex::new(Some(PipelineManager::new(conn))),
         }
     }
 
-    fn get_mut(&self) -> MutexGuard<'_, Option<MutabableInner<C>>> {
-        self.inner.lock().unwrap()
+    fn lock(&self) -> MutexGuard<'_, Option<PipelineManager<C>>> {
+        self.inner.lock().expect("Could not get `Pipeline` lock")
     }
 
     pub async fn join(&self) -> sqlx_core::Result<()> {
-        let lock = self.inner.lock().unwrap().take().unwrap();
+        let lock = self.lock().take().unwrap();
         lock.join().await
-    }
-}
-
-struct MutabableInner<C: DerefMut<Target = PgConnection>> {
-    conn: C,
-    queries: Vec<QueryState>,
-    state: PipelineState,
-}
-
-impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
-    fn push(
-        &mut self,
-        mut query: impl Execute<'q, Postgres>,
-    ) -> flume::Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>> {
-        let (tx, rx) = flume::unbounded();
-        let args = query.take_arguments();
-        let execute = QueryState {
-            next_step: state::PipelineStep::GetOrPrepare,
-            is_done: false,
-            sql: query.sql().to_string(),
-            arguments: args.unwrap().unwrap(),
-            should_flush_before_next: false,
-            sender: tx,
-        };
-        self.queries.push(execute);
-        rx
-    }
-
-    pub async fn join(mut self) -> sqlx_core::Result<()> {
-        let conn = self.conn.deref_mut();
-        conn.wait_until_ready().await?;
-
-        loop {
-            let mut all_done = true;
-            let mut has_flushed = false;
-            for query in &mut self.queries {
-                if query.is_done {
-                    continue;
-                } else {
-                    all_done = false;
-                }
-                if query.should_flush_before_next {
-                    if !has_flushed {
-                        // println!("is flushing");
-                        conn.inner.stream.flush().await?;
-                        has_flushed = true;
-                    }
-
-                    query.should_flush_before_next = false;
-                }
-                let result = query.next(conn, &mut self.state).await;
-                if let Err(result) = result {
-                    query.handle_error(&mut self.state, conn).await?;
-                    // panic!("{result}");
-                    query.is_done = true;
-                    dbg!(&result);
-                    let _ = query.sender.send(Some(Err(result)));
-                }
-            }
-
-            if all_done {
-                break;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub async fn resolve_types(
-        args: &[PgTypeInfo],
-        conn: &mut PgConnection,
-    ) -> sqlx_core::Result<Vec<Oid>> {
-        let mut oids = Vec::new();
-        for ty in args {
-            oids.push(conn.resolve_type_id(&ty.0).await?);
-        }
-        Ok(oids)
-    }
-
-    fn start_parse(
-        conn: &mut PgConnection,
-        sql: &str,
-        param_types: &[Oid],
-    ) -> sqlx_core::Result<()> {
-        let id = conn.inner.next_statement_id;
-        conn.inner.next_statement_id = id.next();
-
-        // next we send the PARSE command to the server
-        conn.inner.stream.write_msg(Parse {
-            param_types: &param_types,
-            query: sql,
-            statement: id,
-        })?;
-        Ok(())
     }
 }
 
@@ -178,7 +82,7 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
 
     fn fetch_many<'e, 'q, E>(
         self,
-        mut query: E,
+        query: E,
     ) -> BoxStream<'e, Result<Either<PgQueryResult, PgRow>, Error>>
     where
         'c: 'e,
@@ -186,7 +90,19 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
         'q: 'e,
         E: 'q,
     {
-        todo!()
+        let mut pipeline = self.lock();
+        let p = Option::as_mut(&mut pipeline).expect("Dropped");
+        let rx = p.push(query);
+
+
+        Box::pin(try_stream! {
+            while let Ok(Some(v)) = rx.recv_async().await {
+                let v = v?;
+                r#yield!(v);
+            }
+
+            Ok(())
+        })
     }
 
     fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<PgRow>, Error>>
@@ -196,7 +112,7 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
         'q: 'e,
         E: 'q,
     {
-        let mut pipeline = self.get_mut();
+        let mut pipeline = self.lock();
         let pipeline = Option::as_mut(&mut pipeline).expect("Dropped");
         let rx = pipeline.push(query);
 
