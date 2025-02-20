@@ -161,6 +161,7 @@ impl PgConnection {
 
     #[inline(always)]
     pub(crate) fn write_sync(&mut self) {
+        println!("Pushing SYNC");
         self.inner
             .stream
             .write_msg(message::Sync)

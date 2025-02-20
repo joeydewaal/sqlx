@@ -13,6 +13,7 @@ use sqlx_core::{
 use state::{PipelineState, QueryState};
 
 mod state;
+mod cache;
 // Parse -> Bind -> Execute -> Close
 
 // -- Create prepared statement --
@@ -86,7 +87,7 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutabableInner<C> {
     fn push(
         &mut self,
         mut query: impl Execute<'q, Postgres>,
-    ) -> flume::Receiver<Result<Either<PgQueryResult, PgRow>, Error>> {
+    ) -> flume::Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>> {
         let (tx, rx) = flume::unbounded();
         let args = query.take_arguments();
         let execute = QueryState {
@@ -197,7 +198,7 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
 
         Box::pin(async move {
             let mut ret = None;
-            while let Ok(result) = rx.recv_async().await {
+            while let Ok(Some(result)) = rx.recv_async().await {
                 match result {
                     Ok(Either::Right(r)) if ret.is_none() => ret = Some(r),
                     _ => {}

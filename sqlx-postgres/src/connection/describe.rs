@@ -18,7 +18,7 @@ use std::sync::Arc;
 ///
 /// See <https://www.postgresql.org/docs/13/catalog-pg-type.html>
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TypType {
+pub enum TypType {
     Base,
     Composite,
     Domain,
@@ -50,7 +50,7 @@ impl TryFrom<i8> for TypType {
 ///
 /// See <https://www.postgresql.org/docs/13/catalog-pg-type.html#CATALOG-TYPCATEGORY-TABLE>
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum TypCategory {
+pub enum TypCategory {
     Array,
     Boolean,
     Composite,

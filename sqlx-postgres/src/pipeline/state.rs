@@ -1,5 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
+use flume::Receiver;
 use sqlx_core::{arguments::Arguments, Either, Error};
 
 use crate::{
@@ -15,6 +16,7 @@ use crate::{
 };
 
 pub struct PipelineState {
+    depth: usize,
     preparing: HashSet<String>,
 }
 
@@ -22,26 +24,32 @@ impl PipelineState {
     pub fn new() -> Self {
         Self {
             preparing: HashSet::new(),
+            depth: 0,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct QueryState {
     pub next_step: PipelineStep,
     pub sql: String,
     pub arguments: PgArguments,
     pub should_flush_before_next: bool,
-    pub sender: flume::Sender<Result<Either<PgQueryResult, PgRow>, Error>>,
+    pub sender: flume::Sender<Option<Result<Either<PgQueryResult, PgRow>, Error>>>,
     pub is_done: bool,
 }
 
+#[derive(Clone)]
 pub enum PipelineStep {
     GetOrPrepare,
     ParseDescribe,
     ReceiveParseDescribe(StatementId),
     BindExecuteClose(StatementId, Arc<PgStatementMetadata>),
     ReceiveData(Arc<PgStatementMetadata>),
-    FillCache(Box<PipelineStep>),
+    FillCache(
+        Box<QueryState>,
+        Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>>,
+    ),
 }
 
 fn get_pg_type(oid: Oid, conn: &PgConnection) -> Option<PgTypeInfo> {
@@ -75,28 +83,34 @@ impl QueryState {
         conn: &mut PgConnection,
         state: &mut PipelineState,
     ) -> sqlx_core::Result<()> {
-        self.next_step = match &self.next_step {
+        print!("{} - ", state.depth);
+        self.next_step = match &mut self.next_step {
             PipelineStep::GetOrPrepare => {
+                println!("GetOrPrepare");
                 // dbg!(&conn.inner.cache_statement);
                 if let Some((statement_id, metadata)) =
                     conn.inner.cache_statement.get_mut(&self.sql)
                 {
-                    // println!("Got cached");
+                    println!("Got cached");
                     PipelineStep::BindExecuteClose(*statement_id, metadata.clone())
                 } else {
                     if state.preparing.contains(&self.sql) {
-                        // println!("Is already preqaring stmt");
+                        println!("Is already preqaring stmt");
                         PipelineStep::GetOrPrepare
                     } else {
-                        // println!("Preparing");
+                        println!("Preparing");
                         state.preparing.insert(self.sql.clone());
                         PipelineStep::ParseDescribe
                     }
                 }
             }
             PipelineStep::ParseDescribe => {
+                println!("ParseDescribe");
                 let id = conn.inner.next_statement_id;
                 conn.inner.next_statement_id = id.next();
+
+                let mut unresolved_oids = Vec::new();
+                let mut unresolved_typ = Vec::new();
 
                 let mut oids = Vec::new();
                 let mut argument_types = Vec::new();
@@ -108,39 +122,59 @@ impl QueryState {
                             println!("Wanted: {ty:?}");
                             argument_types.push(ty);
                         } else {
-                            unimplemented!("Could not resolv OID {:?}", oid);
+                            unresolved_oids.push(oid);
                         }
 
                         oids.push(oid);
                     } else {
-                        unimplemented!("Could not resolve pg type: {ty:?}");
+                        unresolved_typ.push(ty.name());
                     }
                 }
 
-                let r = conn.inner.cache_type_info.get(&oids[0]);
-                // dbg!(&r);
+                if !unresolved_oids.is_empty() || !unresolved_typ.is_empty() {
+                    println!("Fetching types: {unresolved_oids:?} {unresolved_typ:?}");
 
-                // dbg!(&oids);
-                // println!("Pushing Parse");
-                conn.inner.stream.write_msg(Parse {
-                    param_types: &oids,
-                    query: &self.sql,
-                    statement: id,
-                })?;
+                    let mut arguments = PgArguments::default();
 
-                // println!("Pushing Describe");
-                conn.inner
-                    .stream
-                    .write_msg(message::Describe::Statement(id))?;
+                    arguments.add(&unresolved_oids).unwrap();
+                    arguments.add(&unresolved_typ).unwrap();
 
-                conn.write_sync();
+                    let (tx, rx) = flume::unbounded();
+                    state.depth += 1;
+                    PipelineStep::FillCache(
+                        Box::new(QueryState {
+                            next_step: PipelineStep::GetOrPrepare,
+                            sql: SQL.to_string(),
+                            arguments,
+                            is_done: false,
+                            sender: tx,
+                            should_flush_before_next: false,
+                        }),
+                        rx,
+                    )
+                } else {
+                    println!("Pushing Parse");
+                    conn.inner.stream.write_msg(Parse {
+                        param_types: &oids,
+                        query: &self.sql,
+                        statement: id,
+                    })?;
 
-                self.arguments.apply_patches(conn, &argument_types).await?;
+                    println!("Pushing Describe");
+                    conn.inner
+                        .stream
+                        .write_msg(message::Describe::Statement(id))?;
 
-                self.should_flush_before_next = true;
-                PipelineStep::ReceiveParseDescribe(id)
+                    conn.write_sync();
+
+                    self.arguments.apply_patches(conn, &argument_types).await?;
+
+                    self.should_flush_before_next = true;
+                    PipelineStep::ReceiveParseDescribe(id)
+                }
             }
             PipelineStep::ReceiveParseDescribe(statement_id) => {
+                println!("ReceiveParseDescribe");
                 conn.inner.stream.recv_expect::<ParseComplete>().await?;
                 let parameters = recv_desc_params(conn).await?;
 
@@ -178,8 +212,8 @@ impl QueryState {
                 PipelineStep::BindExecuteClose(*statement_id, metadata)
             }
             PipelineStep::BindExecuteClose(statement_id, param) => {
-                // dbg!(&statement_id, param);
-                // println!("Writing BIND");
+                println!("BindExecuteClose");
+                println!("Writing BIND");
                 conn.inner.stream.write_msg(Bind {
                     portal: PortalId::UNNAMED,
                     statement: *statement_id,
@@ -188,12 +222,12 @@ impl QueryState {
                     params: &self.arguments.buffer,
                     result_formats: &[PgValueFormat::Binary],
                 })?;
-                // println!("Writing EXECUTE");
+                println!("Writing EXECUTE");
                 conn.inner.stream.write_msg(message::Execute {
                     portal: PortalId::UNNAMED,
                     limit: 0, //FIXME
                 })?;
-                // println!("Writing CLOSE");
+                println!("Writing CLOSE");
                 conn.inner
                     .stream
                     .write_msg(Close::Portal(PortalId::UNNAMED))?;
@@ -203,6 +237,7 @@ impl QueryState {
                 PipelineStep::ReceiveData(param.clone())
             }
             PipelineStep::ReceiveData(metadata) => {
+                println!("ReceiveData");
                 loop {
                     let message = conn.inner.stream.recv().await?;
 
@@ -224,14 +259,21 @@ impl QueryState {
                     BackendMessageFormat::CommandComplete => {
                         // a SQL command completed normally
                         let cc: CommandComplete = message.decode()?;
+                        self.is_done = true;
 
                         let rows_affected = cc.rows_affected();
                         // logger.increase_rows_affected(rows_affected);
-                        if self.sender.send(Ok(Either::Left(PgQueryResult {
+                        if self.sender.send(Some(Ok(Either::Left(PgQueryResult {
                             rows_affected,
-                        }))).is_err() {
+                        })))).is_err() {
+                            println!("Done");
                             return Ok(());
+                        } else {
+                            self.sender.send(None);
                         };
+
+                        println!("Done");
+                        return Ok(());
                     }
 
                     BackendMessageFormat::EmptyQueryResponse => {
@@ -267,7 +309,8 @@ impl QueryState {
                             metadata: Arc::clone(&metadata),
                         };
 
-                        let _ = self.sender.send(Ok(Either::Right(row)));
+                        dbg!(&row);
+                        let _ = self.sender.send(Some(Ok(Either::Right(row))));
                     }
 
                     BackendMessageFormat::ReadyForQuery => {
@@ -284,10 +327,35 @@ impl QueryState {
                     }
                 }
                 }
+            self.sender.send(None);
                 self.is_done = true;
                 return Ok(());
             }
-            _ => todo!(),
+            PipelineStep::FillCache(query, rx) => {
+                // println!("FillCache");
+                let mut query = query.clone();
+                Box::pin(async { query.next(conn, state).await }).await?;
+
+                self.should_flush_before_next = query.should_flush_before_next;
+
+                println!("Is_done: {}", query.is_done);
+
+                if query.is_done {
+                    let mut rows = Vec::new();
+                    println!("Here");
+                    while let Ok(Some(res)) = rx.recv_async().await {
+                        println!("Got");
+                        let res = res?;
+                        rows.push(res);
+                    }
+                    println!("Done");
+                    dbg!(&rows);
+                    state.depth -= 1;
+                    PipelineStep::ParseDescribe
+                } else {
+                    PipelineStep::FillCache(query, rx.clone())
+                }
+            }
         };
 
         Ok(())
@@ -318,3 +386,84 @@ async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription
 
     Ok(rows)
 }
+
+const SQL: &'static str = "
+WITH RECURSIVE fetch_type AS (
+    SELECT
+        oid::regtype::text AS name,
+        pg_type.oid,
+        typtype,
+        typcategory,
+        typrelid,
+        typelem,
+        typbasetype,
+        ARRAY(
+            SELECT enumlabel
+            FROM pg_enum
+            WHERE enumtypid = pg_type.oid
+        ) AS enum_labels,
+        ARRAY(
+            SELECT (attname, atttypid)
+            FROM pg_attribute AS attr
+            WHERE
+                attr.attrelid = pg_type.typrelid
+                AND NOT attr.attisdropped
+                AND attr.attnum > 0
+        ) AS attr_oids
+    FROM
+        pg_type
+    WHERE
+        pg_type.oid = any($1::OID[]) or typname = any(array(select lower(x) from unnest($2::text[]) as x))
+
+    UNION ALL
+
+    SELECT
+        t.oid::regtype::text AS name,
+        t.oid,
+        t.typtype,
+        t.typcategory,
+        t.typrelid,
+        t.typelem,
+        t.typbasetype,
+        ARRAY(
+            SELECT enumlabel
+            FROM pg_enum
+            WHERE enumtypid = t.oid
+        ) AS enum_labels,
+        ARRAY(
+            SELECT (attname, atttypid)
+            FROM pg_attribute AS attr
+            WHERE
+                attr.attrelid = t.typrelid
+                AND NOT attr.attisdropped
+                AND attr.attnum > 0
+        ) AS attr_oids
+    FROM
+        pg_type t
+    INNER JOIN
+        fetch_type ft1
+        ON t.oid = ft1.typbasetype
+           OR t.oid = ft1.typelem
+           OR t.oid = ft1.typrelid
+           OR t.oid = ANY(ARRAY(
+               SELECT atttypid
+               FROM pg_attribute AS attr
+               WHERE
+                   attr.attrelid = ft1.typrelid
+                   AND NOT attr.attisdropped
+                   AND attr.attnum > 0
+           ))
+)
+SELECT
+    name,
+    oid,
+    typtype,
+    typcategory,
+    typbasetype,
+    enum_labels,
+    attr_oids
+FROM
+    fetch_type
+ORDER BY
+    oid
+";
