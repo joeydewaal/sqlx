@@ -174,7 +174,6 @@ impl PgConnection {
             // cache the type name <-> oid relationship in a paired hashmap
             // so we don't come down this road again
             self.inner.cache_type_info.insert(oid, info.clone());
-        println!("Inserting {oid:?} : {:?}", info.0.name());
             self.inner
                 .cache_type_oid
                 .insert(info.0.name().to_string().into(), oid);
@@ -192,7 +191,6 @@ impl PgConnection {
     }
 
     async fn fetch_type_by_oid(&mut self, oid: Oid) -> Result<PgTypeInfo, Error> {
-        println!("fetching");
         let (name, typ_type, category, relation_id, element, base_type): (
             String,
             i8,
@@ -376,7 +374,6 @@ WHERE rngtypid = $1
                 type_name: name.into(),
             })?;
 
-        println!("Inserting {oid:?} : {name:?}");
         self.inner
             .cache_type_oid
             .insert(name.to_string().into(), oid);
@@ -404,7 +401,6 @@ WHERE rngtypid = $1
                 })?;
 
         // Avoids copying `elem_name` until necessary
-        println!("inserting {elem_oid:?} {:?}", array.elem_name);
         self.inner
             .cache_type_oid
             .entry_ref(&array.elem_name)

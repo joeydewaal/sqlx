@@ -16,7 +16,6 @@ use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
 use futures_core::Stream;
 use futures_util::TryStreamExt;
-use sqlx_core::arguments::Arguments;
 use sqlx_core::Either;
 use std::{borrow::Cow, pin::pin, sync::Arc};
 
@@ -58,7 +57,6 @@ async fn prepare(
     })?;
 
     if metadata.is_none() {
-        // println!("Describe {id:?}");
         // get the statement columns and parameters
         conn.inner
             .stream
@@ -101,16 +99,18 @@ async fn prepare(
         })
     };
 
-    // println!("Metadata: {metadata:?}");
-
     Ok((id, metadata))
 }
 
-async fn recv_desc_params(conn: &mut PgConnection) -> Result<ParameterDescription, Error> {
+pub(crate) async fn recv_desc_params(
+    conn: &mut PgConnection,
+) -> Result<ParameterDescription, Error> {
     conn.inner.stream.recv_expect().await
 }
 
-async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription>, Error> {
+pub(crate) async fn recv_desc_rows(
+    conn: &mut PgConnection,
+) -> Result<Option<RowDescription>, Error> {
     let rows: Option<RowDescription> = match conn.inner.stream.recv().await? {
         // describes the rows that will be returned when the statement is eventually executed
         message if message.format == BackendMessageFormat::RowDescription => {
@@ -185,15 +185,18 @@ impl PgConnection {
             return Ok((*statement).clone());
         }
 
-        // println!("prepare {parameters:?} {metadata:?}");
         let statement = prepare(self, sql, parameters, metadata).await?;
 
-        if store_to_cache {
-            self.store_to_cache(sql, statement.clone())?;
-            self.inner.stream.flush().await?;
+        if store_to_cache && self.inner.cache_statement.is_enabled() {
+            if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
+                self.inner.stream.write_msg(Close::Statement(id))?;
+                self.write_sync();
 
-            self.wait_for_close_complete(1).await?;
-            self.recv_ready_for_query().await?;
+                self.inner.stream.flush().await?;
+
+                self.wait_for_close_complete(1).await?;
+                self.recv_ready_for_query().await?;
+            }
         }
 
         Ok(statement)
@@ -224,9 +227,7 @@ impl PgConnection {
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
-
         // before we continue, wait until we are "ready" to accept more queries
-        // println!("Waiting until ready");
         self.wait_until_ready().await?;
 
         let mut metadata: Arc<PgStatementMetadata>;
@@ -238,16 +239,10 @@ impl PgConnection {
             // making the max number of parameters 65535, not 32767
             // https://github.com/launchbadge/sqlx/issues/3464
             // https://www.postgresql.org/docs/current/limits.html
-            let num_params = u16::try_from(arguments.len()).map_err(|_| {
-                err_protocol!(
-                    "PgConnection::run(): too many arguments for query: {}",
-                    arguments.len()
-                )
-            })?;
+            let num_params = arguments.safe_len()?;
 
             // prepare the statement if this our first time executing it
             // always return the statement ID here
-            // println!("get_or_prepare");
             let (statement, metadata_) = self
                 .get_or_prepare(query, &arguments.types, persistent, metadata_opt)
                 .await?;
@@ -312,6 +307,16 @@ impl PgConnection {
 
         self.inner.stream.flush().await?;
 
+        self.receive_rows(query, metadata, format)
+    }
+
+    pub(crate) fn receive_rows<'e, 'c: 'e, 'q: 'e>(
+        &'c mut self,
+        query: &'q str,
+        mut metadata: Arc<PgStatementMetadata>,
+        format: PgValueFormat,
+    ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
+        let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
         Ok(try_stream! {
             loop {
                 let message = self.inner.stream.recv().await?;

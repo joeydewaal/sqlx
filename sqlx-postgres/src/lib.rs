@@ -16,6 +16,7 @@ mod io;
 mod listener;
 mod message;
 mod options;
+mod pipeline;
 mod query_result;
 mod row;
 mod statement;
@@ -24,7 +25,6 @@ mod type_checking;
 mod type_info;
 pub mod types;
 mod value;
-mod pipeline;
 
 #[cfg(feature = "any")]
 // We are hiding the any module with its AnyConnectionBackend trait
@@ -50,12 +50,14 @@ pub use advisory_lock::{PgAdvisoryLock, PgAdvisoryLockGuard, PgAdvisoryLockKey};
 pub use arguments::{PgArgumentBuffer, PgArguments};
 pub use column::PgColumn;
 pub use connection::PgConnection;
+pub(crate) use connection::{recv_desc_params, recv_desc_rows};
 pub use copy::{PgCopyIn, PgPoolCopyExt};
 pub use database::Postgres;
 pub use error::{PgDatabaseError, PgErrorPosition};
 pub use listener::{PgListener, PgNotification};
 pub use message::PgSeverity;
 pub use options::{PgConnectOptions, PgSslMode};
+pub use pipeline::PgPipeline;
 pub use query_result::PgQueryResult;
 pub use row::PgRow;
 pub use statement::PgStatement;
@@ -63,7 +65,6 @@ pub use transaction::PgTransactionManager;
 pub use type_info::{PgTypeInfo, PgTypeKind};
 pub use types::PgHasArrayType;
 pub use value::{PgValue, PgValueFormat, PgValueRef};
-pub use pipeline::PgPipeline;
 
 /// An alias for [`Pool`][crate::pool::Pool], specialized for Postgres.
 pub type PgPool = crate::pool::Pool<Postgres>;

@@ -109,7 +109,7 @@ impl<'q, C: DerefMut<Target = PgConnection>> MutableInner<C> {
         // Make sure we are ready. Flush out the buffer, etc.
         context.wait_until_ready().await?;
 
-        while !join_manager.is_done() {
+        while !join_manager.all_completed() {
             join_manager.setup();
 
             for opt_query in &mut self.queries {

@@ -18,7 +18,7 @@ impl JoinManager {
     }
 
     #[inline(always)]
-    pub(super) fn is_done(&self) -> bool {
+    pub(super) fn all_completed(&self) -> bool {
         self.all_completed
     }
 
@@ -39,18 +39,18 @@ impl JoinManager {
         context: &mut PipelineContext<'_>,
     ) -> sqlx_core::Result<()> {
         if let Some(query) = opt_query {
-            // Make sure that we get run again.
-            self.set_not_completed();
-
             // Flush buffer but only if we need to.
             self.handle_flush(query, context.conn).await?;
 
             // Call the state machine.
             query.handle_next(context).await?;
 
-            // Remove the state machine if the query is done.
             if query.is_done {
+                // Remove the state machine if the query is done.
                 *opt_query = None;
+            } else {
+                // If we are not done, make sure that we get run again.
+                self.set_not_completed();
             }
         } else {
             // Query done executing.

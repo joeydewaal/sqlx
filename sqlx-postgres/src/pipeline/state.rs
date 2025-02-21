@@ -1,14 +1,12 @@
+use futures_util::{stream::StreamExt, TryStreamExt};
 use std::{collections::HashSet, sync::Arc};
 
 use flume::Receiver;
-use sqlx_core::{arguments::Arguments, ext::ustr::UStr, Either, Error};
+use sqlx_core::{ext::ustr::UStr, logger::QueryLogger, Either, Error};
 
 use crate::{
     io::{PortalId, StatementId},
-    message::{
-        self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, ParameterDescription,
-        Parse, ParseComplete, RowDescription,
-    },
+    message::{self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, Parse},
     pipeline::cache::{recursive_find, FetchByOid},
     statement::PgStatementMetadata,
     type_info::PgType,
@@ -20,7 +18,7 @@ use super::context::PipelineContext;
 
 pub struct PipelineState {
     depth: usize,
-    preparing: HashSet<String>,
+    pub(super) preparing: HashSet<String>,
 }
 
 impl PipelineState {
@@ -76,11 +74,29 @@ pub enum PipelineStep {
     //  -> Go to `BindExecuteClose` if it is cached. The query is ready to be executed.
     GetOrPrepare,
 
-    // If there are any custom types in the quer
+    // If there are any custom types in the query arguments see if they are cached
+    // -> If they are not cached go to FillCache and fetch them
+    //
+    // -> If they are in the type cache, push a `Parse` and `Describe` in the write buffer. Parse
+    // prepares the query, describe fetches metadata for the rows that are returned
     ParseDescribe,
+
+    // Receives `ParseComplete` for the `Parse` message, `ParameterDescription` and
+    // `RowDescription` for the `Describe` message.
+    //
+    // Lookup types in the rows in cache.
+    // -> If they are not cached, go to `FillCache` and look them up.
+    // -> If all the types are in cache/known, go to `BindExecuteClose`
     ReceiveParseDescribe(StatementId),
+
+    // Push a `Bind`, `Execute`, `Close` and `Sync` message in the write buffer. This step executes
+    // the query. After this Postgres sends back rows. Go to `ReceiveData` to receive the data.
     BindExecuteClose(StatementId, Arc<PgStatementMetadata>),
+
+    // Receives the data.
     ReceiveData(Arc<PgStatementMetadata>),
+
+    // This step fetches the given Oids and named types and stores them in cache.
     FillCache(
         Box<QueryState>,
         Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>>,
@@ -129,31 +145,93 @@ impl QueryState {
         Ok(())
     }
 
-    pub async fn next(&mut self, c: &mut PipelineContext<'_>) -> sqlx_core::Result<()> {
-        print!("{} - ", c.state.depth);
+    #[inline(always)]
+    fn write_parse_into(
+        &self,
+        conn: &mut PgConnection,
+        oids: &[Oid],
+        stmt_id: StatementId,
+    ) -> sqlx_core::Result<()> {
+        println!("Pushing Parse");
+        conn.inner.stream.write_msg(Parse {
+            param_types: &oids,
+            query: &self.sql,
+            statement: stmt_id,
+        })
+    }
+
+    #[inline(always)]
+    fn write_describe_into(
+        &self,
+        conn: &mut PgConnection,
+        stmt_id: StatementId,
+    ) -> sqlx_core::Result<()> {
+        println!("Pushing Describe");
+        conn.inner
+            .stream
+            .write_msg(message::Describe::Statement(stmt_id))
+    }
+
+    #[inline(always)]
+    fn write_bind_into(
+        &self,
+        conn: &mut PgConnection,
+        statement: StatementId,
+        portal: PortalId,
+    ) -> sqlx_core::Result<()> {
+        conn.inner.stream.write_msg(Bind {
+            portal,
+            statement,
+            formats: &[PgValueFormat::Binary],
+            num_params: self.arguments.safe_len()?,
+            params: &self.arguments.buffer,
+            result_formats: &[PgValueFormat::Binary],
+        })
+    }
+
+    #[inline(always)]
+    fn write_execute_into(
+        &self,
+        conn: &mut PgConnection,
+        portal: PortalId,
+        limit: u32,
+    ) -> sqlx_core::Result<()> {
+        conn.inner
+            .stream
+            .write_msg(message::Execute { portal, limit })
+    }
+
+    #[inline(always)]
+    fn write_close_into(&self, conn: &mut PgConnection, portal: PortalId) -> sqlx_core::Result<()> {
+        conn.inner
+            .stream
+            .write_msg(Close::Portal(PortalId::UNNAMED))
+    }
+
+    pub async fn next(&mut self, context: &mut PipelineContext<'_>) -> sqlx_core::Result<()> {
+        print!(" - {}", context.state.depth);
         self.next_step = match &mut self.next_step {
             PipelineStep::GetOrPrepare => {
                 println!("GetOrPrepare");
-                // dbg!(&conn.inner.cache_statement);
-                if let Some((statement_id, metadata)) =
-                    c.conn.inner.cache_statement.get_mut(&self.sql)
-                {
-                    PipelineStep::BindExecuteClose(*statement_id, metadata.clone())
+
+                if let Some((stmt_id, meta)) = context.get_prepared(&self.sql) {
+                    // If this statement is prepared, go and execute it.
+                    PipelineStep::BindExecuteClose(stmt_id, meta)
+                } else if context.is_preparing_this_iter(&self.sql) {
+                    // If this statement is already being prepared, we do nothing. Check the cache
+                    // again next iteration.
+                    PipelineStep::GetOrPrepare
                 } else {
-                    if c.state.preparing.contains(&self.sql) {
-                        // println!("Is already preqaring stmt");
-                        PipelineStep::GetOrPrepare
-                    } else {
-                        // println!("Preparing");
-                        c.state.preparing.insert(self.sql.clone());
-                        PipelineStep::ParseDescribe
-                    }
+                    // Make sure we don't prepare this query again this iteration.
+                    context.register_prepare(self.sql.clone());
+                    PipelineStep::ParseDescribe
                 }
             }
             PipelineStep::ParseDescribe => {
                 println!("ParseDescribe");
-                let id = c.conn.inner.next_statement_id;
-                c.conn.inner.next_statement_id = id.next();
+
+                // Get the id for the next named prepared statement
+                let stmt_id = context.next_stmt_id();
 
                 let mut unresolved_oids = Vec::new();
                 let mut unresolved_typ = Vec::new();
@@ -162,8 +240,8 @@ impl QueryState {
                 let mut argument_types = Vec::new();
 
                 for ty in &self.arguments.types {
-                    if let Some(oid) = get_oid(&ty.0, c.conn) {
-                        if let Some(ty) = get_pg_type(oid, c.conn) {
+                    if let Some(oid) = get_oid(&ty.0, context.conn) {
+                        if let Some(ty) = get_pg_type(oid, context.conn) {
                             argument_types.push(ty);
                         } else {
                             unresolved_oids.push(oid);
@@ -183,170 +261,127 @@ impl QueryState {
                     arguments.add(&unresolved_oids).map_err(Error::Encode)?;
                     arguments.add(&unresolved_typ).map_err(Error::Encode)?;
 
-                    c.state.depth += 1;
+                    context.state.depth += 1;
                     let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);
                     PipelineStep::FillCache(Box::new(q_state), rx, unresolved_oids, unresolved_typ)
                 } else {
-                    // println!("Pushing Parse");
-                    c.conn.inner.stream.write_msg(Parse {
-                        param_types: &oids,
-                        query: &self.sql,
-                        statement: id,
-                    })?;
+                    // All oid of arguments (Domain, Composite,...) are fetched and in cache. This
+                    // query is ready to be prepared.
 
-                    // println!("Pushing Describe");
-                    c.conn
-                        .inner
-                        .stream
-                        .write_msg(message::Describe::Statement(id))?;
+                    // Write a `Parse` message.
+                    self.write_parse_into(&mut context.conn, &oids, stmt_id)?;
 
-                    c.conn.write_sync();
+                    // Write a `Describe` message.
+                    self.write_describe_into(&mut context.conn, stmt_id)?;
 
+                    // Write a `Sync` message.
+                    context.conn.write_sync();
+
+                    // Apply patches that are needed to the given arguments. This should NEVER
+                    // fetch types.
                     self.arguments
-                        .apply_patches(c.conn, &argument_types)
+                        .apply_patches(context.conn, &argument_types)
                         .await?;
 
+                    // To ensure we get a response from Postgres we should flush the buffer before
                     self.should_flush_before_next = true;
-                    PipelineStep::ReceiveParseDescribe(id)
+
+                    PipelineStep::ReceiveParseDescribe(stmt_id)
                 }
             }
             PipelineStep::ReceiveParseDescribe(statement_id) => {
                 println!("ReceiveParseDescribe");
-                c.conn.inner.stream.recv_expect::<ParseComplete>().await?;
-                let parameters = recv_desc_params(c.conn).await?;
 
-                let rows = recv_desc_rows(c.conn).await?;
+                // Receive a `ParseComplete` message from our previous `Parse` command.
+                context.receive_parse_complete().await?;
 
-                let parameters = c.conn.handle_parameter_description(parameters).await?;
+                // Receive `ParameterDescription` and `RowDescription` from the previous
+                // `Describe` command.
+                let (parameters, rows) = context.handle_param_row_description().await?;
 
-                let (columns, column_names) = c.conn.handle_row_description(rows, true).await?;
-
-                // ensure that if we did fetch custom data, we wait until we are fully ready before
-                // continuing
-                c.conn.recv_ready_for_query().await?;
-
-                let metadata = Arc::new(PgStatementMetadata {
-                    parameters,
-                    columns,
-                    column_names: Arc::new(column_names),
-                });
-
-                c.conn
-                    .store_to_cache(&self.sql, (*statement_id, metadata.clone()))?;
-                c.state.preparing.remove(&self.sql);
-
-                PipelineStep::BindExecuteClose(*statement_id, metadata)
-            }
-            PipelineStep::BindExecuteClose(statement_id, param) => {
-                println!("BindExecuteClose");
-                // println!("Writing BIND");
-                c.conn.inner.stream.write_msg(Bind {
-                    portal: PortalId::UNNAMED,
-                    statement: *statement_id,
-                    formats: &[PgValueFormat::Binary],
-                    num_params: self.arguments.len() as u16, // FIXME
-                    params: &self.arguments.buffer,
-                    result_formats: &[PgValueFormat::Binary],
-                })?;
-                // println!("Writing EXECUTE");
-                c.conn.inner.stream.write_msg(message::Execute {
-                    portal: PortalId::UNNAMED,
-                    limit: 0, //FIXME
-                })?;
-                // println!("Writing CLOSE");
-                c.conn
-                    .inner
-                    .stream
-                    .write_msg(Close::Portal(PortalId::UNNAMED))?;
-
-                self.should_flush_before_next = true;
-                c.conn.write_sync();
-                PipelineStep::ReceiveData(param.clone())
-            }
-            PipelineStep::ReceiveData(metadata) => {
-                println!("ReceiveData");
-                loop {
-                    let message = c.conn.inner.stream.recv().await?;
-
-                    match message.format {
-                    BackendMessageFormat::BindComplete
-                    | BackendMessageFormat::ParseComplete
-                    | BackendMessageFormat::ParameterDescription
-                    | BackendMessageFormat::NoData
-                    // unnamed portal has been closed
-                    | BackendMessageFormat::CloseComplete
-                    => {
-                        // harmless messages to ignore
-                    }
-
-                    // "Execute phase is always terminated by the appearance of
-                    // exactly one of these messages: CommandComplete,
-                    // EmptyQueryResponse (if the portal was created from an
-                    // empty query string), ErrorResponse, or PortalSuspended"
-                    BackendMessageFormat::CommandComplete => {
-                        // a SQL command completed normally
-                        let cc: CommandComplete = message.decode()?;
-                        self.is_done = true;
-
-                        let rows_affected = cc.rows_affected();
-                        // logger.increase_rows_affected(rows_affected);
-                        if self.sender.send(Some(Ok(Either::Left(PgQueryResult {
-                            rows_affected,
-                        })))).is_err() {
-                            // println!("Done");
-                            return Ok(());
+                let mut unresolved_oids = Vec::new();
+                if let Some(rows) = &rows {
+                    for field in &rows.fields {
+                        if PgTypeInfo::try_from_oid(field.data_type_id).is_none()
+                            && context
+                                .conn
+                                .inner
+                                .cache_type_info
+                                .get(&field.data_type_id)
+                                .is_none()
+                        {
+                            unresolved_oids.push(field.data_type_id);
                         }
                     }
-
-                    BackendMessageFormat::EmptyQueryResponse => {
-                        // empty query string passed to an unprepared execute
-                    }
-
-                    // Message::ErrorResponse is handled in self.stream.recv()
-
-                    // incomplete query execution has finished
-                    BackendMessageFormat::PortalSuspended => {}
-
-                    BackendMessageFormat::RowDescription => {
-                        // indicates that a *new* set of rows are about to be returned
-                        // let (columns, column_names) = self
-                        //     .handle_row_description(Some(message.decode()?), false)
-                        //     .await?;
-
-                        // metadata = Arc::new(PgStatementMetadata {
-                        //     column_names: Arc::new(column_names),
-                        //     columns,
-                        //     parameters: Vec::default(),
-                        // });
-                    }
-
-                    BackendMessageFormat::DataRow => {
-                        // logger.increment_rows_returned();
-
-                        // one of the set of rows returned by a SELECT, FETCH, etc query
-                        let data: DataRow = message.decode()?;
-                        let row = PgRow {
-                            data,
-                            format: PgValueFormat::Binary,
-                            metadata: Arc::clone(&metadata),
-                        };
-
-                        let _ = self.sender.send(Some(Ok(Either::Right(row))));
-                    }
-
-                    BackendMessageFormat::ReadyForQuery => {
-                        // processing of the query string is complete
-                        c.conn.handle_ready_for_query(message)?;
-                        break;
-                    }
-
-                    _ => {
-                        return Err(err_protocol!(
-                            "execute: unexpected message: {:?}",
-                            message.format
-                        ));
-                    }
                 }
+
+                if !unresolved_oids.is_empty() {
+                    dbg!(&unresolved_oids);
+                    context.conn.recv_ready_for_query().await?;
+                    let mut arguments = PgArguments::default();
+
+                    arguments.add(&unresolved_oids).map_err(Error::Encode)?;
+                    arguments.add(&[""; 0]).map_err(Error::Encode)?;
+
+                    context.state.depth += 1;
+                    let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);
+                    PipelineStep::FillCache(Box::new(q_state), rx, unresolved_oids, Vec::new())
+                } else {
+                    // All custom types (from arguments and row fields) are in the type cache, we
+                    // are ready to execute the query.
+
+                    // Get statement metadata from connection type cache.
+                    let metadata = context.statement_metadata(parameters, rows).await?;
+
+                    // ensure that if we did fetch custom data, we wait until we are fully ready before
+                    // continuing
+                    context.conn.recv_ready_for_query().await?;
+
+                    // Store the prepared statement to the connection cache, also remove the query
+                    // from the shared pipeline state.
+                    context.store_to_cache(*statement_id, &self.sql, metadata.clone())?;
+
+                    PipelineStep::BindExecuteClose(*statement_id, metadata)
+                }
+            }
+            PipelineStep::BindExecuteClose(stmt_id, param) => {
+                let param = param.clone();
+                println!("BindExecuteClose");
+                println!("Writing BIND");
+
+                // Write a `Bind` message into the buffer with the arguments.
+                let stmt = *stmt_id;
+                self.write_bind_into(context.conn, stmt, PortalId::UNNAMED)?;
+
+                println!("Writing EXECUTE");
+                // Write an `Execute` message into the buffer to execute the prepared statement.
+                self.write_execute_into(context.conn, PortalId::UNNAMED, 0)?;
+
+                println!("Writing CLOSE");
+                // Write a `Close` message to close the open portal.
+                self.write_close_into(context.conn, PortalId::UNNAMED)?;
+
+                // Write a `Sync` message to get a result back from Postgres.
+                context.conn.write_sync();
+
+                // To ensure we get a response on the next iteration we schedule a flush.
+                self.should_flush_before_next = true;
+
+                PipelineStep::ReceiveData(param)
+            }
+            PipelineStep::ReceiveData(meta) => {
+                println!("ReceiveData");
+
+                let mut stream =
+                    context
+                        .conn
+                        .receive_rows(&self.sql, meta.clone(), PgValueFormat::Binary)?;
+
+                while let Some(value) = stream.next().await {
+                    if self.sender.send(Some(value)).is_err() {
+                        self.is_done = true;
+                        return Ok(());
+                    };
                 }
                 let _ = self.sender.send(None);
                 self.is_done = true;
@@ -355,11 +390,9 @@ impl QueryState {
             PipelineStep::FillCache(query, rx, oids, named_types) => {
                 println!("FillCache");
                 let mut query = query.clone();
-                Box::pin(async { query.next(c).await }).await?;
+                Box::pin(async { query.next(context).await }).await?;
 
                 self.should_flush_before_next = query.should_flush_before_next;
-
-                // println!("Is_done: {}", query.is_done);
 
                 if query.is_done {
                     let mut rows = Vec::new();
@@ -368,7 +401,7 @@ impl QueryState {
                         if let Either::Right(row) = res {
                             let typed_row = FetchByOid::from_row(&row)?;
                             if let Some(ref name) = typed_row.type_name {
-                                c.conn.inner.cache_type_oid.insert(
+                                context.conn.inner.cache_type_oid.insert(
                                     UStr::Shared(name.clone().into()),
                                     typed_row.fetched_oid,
                                 );
@@ -379,11 +412,11 @@ impl QueryState {
                     }
                     for oid in oids {
                         let ty = recursive_find(&mut rows, *oid).expect("Bug");
-                        c.conn.inner.cache_type_info.insert(*oid, ty);
+                        context.conn.inner.cache_type_info.insert(*oid, ty);
                     }
 
                     for named in named_types {
-                        let oid = c
+                        let oid = context
                             .conn
                             .inner
                             .cache_type_oid
@@ -391,11 +424,11 @@ impl QueryState {
                             .copied()
                             .expect("BUG");
                         let ty = recursive_find(&mut rows, oid).expect("Bug");
-                        c.conn.inner.cache_type_info.insert(oid, ty);
+                        context.conn.inner.cache_type_info.insert(oid, ty);
                     }
                     // dbg!(&conn.inner.cache_type_oid);
                     // dbg!(&conn.inner.cache_type_info);
-                    c.state.depth -= 1;
+                    context.state.depth -= 1;
                     PipelineStep::ParseDescribe
                 } else {
                     PipelineStep::FillCache(query, rx.clone(), oids.to_vec(), named_types.to_vec())
@@ -415,31 +448,6 @@ impl QueryState {
         context.conn.recv_ready_for_query().await?;
         Ok(())
     }
-}
-
-async fn recv_desc_params(conn: &mut PgConnection) -> Result<ParameterDescription, Error> {
-    conn.inner.stream.recv_expect().await
-}
-
-async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription>, Error> {
-    let rows: Option<RowDescription> = match conn.inner.stream.recv().await? {
-        // describes the rows that will be returned when the statement is eventually executed
-        message if message.format == BackendMessageFormat::RowDescription => {
-            Some(message.decode()?)
-        }
-
-        // no data would be returned if this statement was executed
-        message if message.format == BackendMessageFormat::NoData => None,
-
-        message => {
-            return Err(err_protocol!(
-                "expecting RowDescription or NoData but received {:?}",
-                message.format
-            ));
-        }
-    };
-
-    Ok(rows)
 }
 
 const SQL: &'static str = "

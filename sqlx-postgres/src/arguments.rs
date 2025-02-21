@@ -122,7 +122,6 @@ impl PgArguments {
         for patch in patches {
             let buf = &mut buffer[patch.buf_offset..];
             let ty = &parameters[patch.arg_index];
-            println!("PATCH: {ty:?}");
 
             (patch.callback)(buf, ty);
         }
@@ -130,16 +129,22 @@ impl PgArguments {
         for (offset, kind) in type_holes {
             println!("fetching");
             let oid = match kind {
-                HoleKind::Type { name } => {
-                    println!("fetching");
-                    conn.fetch_type_id_by_name(name).await?
-                }
+                HoleKind::Type { name } => conn.fetch_type_id_by_name(name).await?,
                 HoleKind::Array(array) => conn.fetch_array_type_id(array).await?,
             };
             buffer[*offset..(*offset + 4)].copy_from_slice(&oid.0.to_be_bytes());
         }
 
         Ok(())
+    }
+
+    pub(crate) fn safe_len(&self) -> sqlx_core::Result<u16> {
+        u16::try_from(self.len()).map_err(|_| {
+            err_protocol!(
+                "PgConnection::run(): too many arguments for query: {}",
+                self.len()
+            )
+        })
     }
 }
 

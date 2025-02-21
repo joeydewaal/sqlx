@@ -19,6 +19,7 @@ use crate::types::Oid;
 use crate::{PgConnectOptions, PgTypeInfo, Postgres};
 
 pub(crate) use sqlx_core::connection::*;
+pub(crate) use executor::{recv_desc_rows, recv_desc_params};
 
 pub use self::stream::PgStream;
 
