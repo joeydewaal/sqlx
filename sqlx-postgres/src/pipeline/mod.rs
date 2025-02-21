@@ -1,3 +1,8 @@
+use crate::{PgConnection, PgQueryResult, PgRow, Postgres};
+use context::PipelineContext;
+use manager::JoinManager;
+use sqlx_core::{executor::Execute, Either, Error};
+use state::QueryState;
 use std::{
     fmt::Debug,
     ops::DerefMut,
@@ -5,12 +10,12 @@ use std::{
 };
 
 use executor::ERROR_MSG;
-use manager::PipelineManager;
+
 mod cache;
+mod context;
 mod executor;
 mod manager;
 mod state;
-mod flush;
 
 // Parse -> Bind -> Execute -> Close
 
@@ -42,10 +47,8 @@ mod flush;
 //
 // 3. Push Bind with portal, and args + execute
 
-use crate::PgConnection;
-
 pub struct PgPipeline<C: DerefMut<Target = PgConnection>> {
-    inner: Mutex<Option<PipelineManager<C>>>,
+    inner: Mutex<Option<MutableInner<C>>>,
 }
 
 impl<C: Debug + DerefMut<Target = PgConnection>> Debug for PgPipeline<C> {
@@ -58,16 +61,62 @@ impl<C: Debug + DerefMut<Target = PgConnection>> Debug for PgPipeline<C> {
 impl<C: DerefMut<Target = PgConnection>> PgPipeline<C> {
     pub fn new(conn: C) -> Self {
         Self {
-            inner: Mutex::new(Some(PipelineManager::new(conn))),
+            inner: Mutex::new(Some(MutableInner::new(conn))),
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<PipelineManager<C>>> {
+    fn lock(&self) -> MutexGuard<'_, Option<MutableInner<C>>> {
         self.inner.lock().expect("Could not get `Pipeline` lock")
     }
 
     pub async fn join(&self) -> sqlx_core::Result<()> {
         let lock = self.lock().take().expect(ERROR_MSG);
         lock.join().await
+    }
+}
+
+pub(super) struct MutableInner<C: DerefMut<Target = PgConnection>> {
+    conn: C,
+    queries: Vec<Option<QueryState>>,
+}
+
+impl<'q, C: DerefMut<Target = PgConnection>> MutableInner<C> {
+    pub(crate) fn new(conn: C) -> MutableInner<C> {
+        MutableInner {
+            conn,
+            queries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        mut query: impl Execute<'q, Postgres>,
+    ) -> flume::Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>> {
+        let args = query.take_arguments();
+        // TODO: Arguments
+        let (q_state, rx) = QueryState::new(query.sql().to_string(), args.unwrap().unwrap());
+        self.queries.push(Some(q_state));
+        rx
+    }
+
+    pub async fn join(mut self) -> sqlx_core::Result<()> {
+        // Manages the queries.
+        let mut join_manager = JoinManager::new();
+
+        // Holds the connection + state shared between queries.
+        let mut context = PipelineContext::new(self.conn.deref_mut());
+
+        // Make sure we are ready. Flush out the buffer, etc.
+        context.wait_until_ready().await?;
+
+        while !join_manager.is_done() {
+            join_manager.setup();
+
+            for opt_query in &mut self.queries {
+                join_manager.handle_next(opt_query, &mut context).await?;
+            }
+        }
+
+        Ok(())
     }
 }

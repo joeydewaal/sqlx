@@ -16,6 +16,8 @@ use crate::{
     PgArguments, PgConnection, PgQueryResult, PgRow, PgTypeInfo, PgValueFormat,
 };
 
+use super::context::PipelineContext;
+
 pub struct PipelineState {
     depth: usize,
     preparing: HashSet<String>,
@@ -30,6 +32,7 @@ impl PipelineState {
     }
 }
 
+// Holds the state machine and data needed to execute a query.
 #[derive(Clone)]
 pub struct QueryState {
     pub next_step: PipelineStep,
@@ -63,9 +66,17 @@ impl QueryState {
     }
 }
 
+// All the states needed to execute a prepared statement.
+// The states are in the order that they are executed.
 #[derive(Clone)]
 pub enum PipelineStep {
+    // Lookup in the statement cache if the query is already prepared.
+    //  -> Go to `ParseDescribe` is it is not in cache. The statement needs to be prepared.
+    //
+    //  -> Go to `BindExecuteClose` if it is cached. The query is ready to be executed.
     GetOrPrepare,
+
+    // If there are any custom types in the quer
     ParseDescribe,
     ReceiveParseDescribe(StatementId),
     BindExecuteClose(StatementId, Arc<PgStatementMetadata>),
@@ -106,12 +117,11 @@ fn get_oid(ty: &PgType, conn: &PgConnection) -> Option<Oid> {
 impl QueryState {
     pub async fn handle_next(
         &mut self,
-        conn: &mut PgConnection,
-        state: &mut PipelineState,
+        context: &mut PipelineContext<'_>,
     ) -> sqlx_core::Result<()> {
-        let result = self.next(conn, state).await;
+        let result = self.next(context).await;
         if let Err(result) = result {
-            self.handle_error(state, conn).await?;
+            self.handle_error(context).await?;
             self.is_done = true;
             dbg!(&result);
             let _ = self.sender.send(Some(Err(result)));
@@ -119,35 +129,31 @@ impl QueryState {
         Ok(())
     }
 
-    pub async fn next(
-        &mut self,
-        conn: &mut PgConnection,
-        state: &mut PipelineState,
-    ) -> sqlx_core::Result<()> {
-        print!("{} - ", state.depth);
+    pub async fn next(&mut self, c: &mut PipelineContext<'_>) -> sqlx_core::Result<()> {
+        print!("{} - ", c.state.depth);
         self.next_step = match &mut self.next_step {
             PipelineStep::GetOrPrepare => {
                 println!("GetOrPrepare");
                 // dbg!(&conn.inner.cache_statement);
                 if let Some((statement_id, metadata)) =
-                    conn.inner.cache_statement.get_mut(&self.sql)
+                    c.conn.inner.cache_statement.get_mut(&self.sql)
                 {
                     PipelineStep::BindExecuteClose(*statement_id, metadata.clone())
                 } else {
-                    if state.preparing.contains(&self.sql) {
+                    if c.state.preparing.contains(&self.sql) {
                         // println!("Is already preqaring stmt");
                         PipelineStep::GetOrPrepare
                     } else {
                         // println!("Preparing");
-                        state.preparing.insert(self.sql.clone());
+                        c.state.preparing.insert(self.sql.clone());
                         PipelineStep::ParseDescribe
                     }
                 }
             }
             PipelineStep::ParseDescribe => {
                 println!("ParseDescribe");
-                let id = conn.inner.next_statement_id;
-                conn.inner.next_statement_id = id.next();
+                let id = c.conn.inner.next_statement_id;
+                c.conn.inner.next_statement_id = id.next();
 
                 let mut unresolved_oids = Vec::new();
                 let mut unresolved_typ = Vec::new();
@@ -156,8 +162,8 @@ impl QueryState {
                 let mut argument_types = Vec::new();
 
                 for ty in &self.arguments.types {
-                    if let Some(oid) = get_oid(&ty.0, conn) {
-                        if let Some(ty) = get_pg_type(oid, conn) {
+                    if let Some(oid) = get_oid(&ty.0, c.conn) {
+                        if let Some(ty) = get_pg_type(oid, c.conn) {
                             argument_types.push(ty);
                         } else {
                             unresolved_oids.push(oid);
@@ -170,32 +176,35 @@ impl QueryState {
                 }
 
                 if !unresolved_oids.is_empty() || !unresolved_typ.is_empty() {
-                    // println!("Fetching types: {unresolved_oids:?} {unresolved_typ:?}");
+                    println!("Fetching types: {unresolved_oids:?} {unresolved_typ:?}");
 
                     let mut arguments = PgArguments::default();
 
                     arguments.add(&unresolved_oids).map_err(Error::Encode)?;
                     arguments.add(&unresolved_typ).map_err(Error::Encode)?;
 
-                    state.depth += 1;
+                    c.state.depth += 1;
                     let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);
                     PipelineStep::FillCache(Box::new(q_state), rx, unresolved_oids, unresolved_typ)
                 } else {
                     // println!("Pushing Parse");
-                    conn.inner.stream.write_msg(Parse {
+                    c.conn.inner.stream.write_msg(Parse {
                         param_types: &oids,
                         query: &self.sql,
                         statement: id,
                     })?;
 
                     // println!("Pushing Describe");
-                    conn.inner
+                    c.conn
+                        .inner
                         .stream
                         .write_msg(message::Describe::Statement(id))?;
 
-                    conn.write_sync();
+                    c.conn.write_sync();
 
-                    self.arguments.apply_patches(conn, &argument_types).await?;
+                    self.arguments
+                        .apply_patches(c.conn, &argument_types)
+                        .await?;
 
                     self.should_flush_before_next = true;
                     PipelineStep::ReceiveParseDescribe(id)
@@ -203,18 +212,18 @@ impl QueryState {
             }
             PipelineStep::ReceiveParseDescribe(statement_id) => {
                 println!("ReceiveParseDescribe");
-                conn.inner.stream.recv_expect::<ParseComplete>().await?;
-                let parameters = recv_desc_params(conn).await?;
+                c.conn.inner.stream.recv_expect::<ParseComplete>().await?;
+                let parameters = recv_desc_params(c.conn).await?;
 
-                let rows = recv_desc_rows(conn).await?;
+                let rows = recv_desc_rows(c.conn).await?;
 
-                let parameters = conn.handle_parameter_description(parameters).await?;
+                let parameters = c.conn.handle_parameter_description(parameters).await?;
 
-                let (columns, column_names) = conn.handle_row_description(rows, true).await?;
+                let (columns, column_names) = c.conn.handle_row_description(rows, true).await?;
 
                 // ensure that if we did fetch custom data, we wait until we are fully ready before
                 // continuing
-                conn.recv_ready_for_query().await?;
+                c.conn.recv_ready_for_query().await?;
 
                 let metadata = Arc::new(PgStatementMetadata {
                     parameters,
@@ -222,15 +231,16 @@ impl QueryState {
                     column_names: Arc::new(column_names),
                 });
 
-                conn.store_to_cache(&self.sql, (*statement_id, metadata.clone()))?;
-                state.preparing.remove(&self.sql);
+                c.conn
+                    .store_to_cache(&self.sql, (*statement_id, metadata.clone()))?;
+                c.state.preparing.remove(&self.sql);
 
                 PipelineStep::BindExecuteClose(*statement_id, metadata)
             }
             PipelineStep::BindExecuteClose(statement_id, param) => {
                 println!("BindExecuteClose");
                 // println!("Writing BIND");
-                conn.inner.stream.write_msg(Bind {
+                c.conn.inner.stream.write_msg(Bind {
                     portal: PortalId::UNNAMED,
                     statement: *statement_id,
                     formats: &[PgValueFormat::Binary],
@@ -239,23 +249,24 @@ impl QueryState {
                     result_formats: &[PgValueFormat::Binary],
                 })?;
                 // println!("Writing EXECUTE");
-                conn.inner.stream.write_msg(message::Execute {
+                c.conn.inner.stream.write_msg(message::Execute {
                     portal: PortalId::UNNAMED,
                     limit: 0, //FIXME
                 })?;
                 // println!("Writing CLOSE");
-                conn.inner
+                c.conn
+                    .inner
                     .stream
                     .write_msg(Close::Portal(PortalId::UNNAMED))?;
 
                 self.should_flush_before_next = true;
-                conn.write_sync();
+                c.conn.write_sync();
                 PipelineStep::ReceiveData(param.clone())
             }
             PipelineStep::ReceiveData(metadata) => {
                 println!("ReceiveData");
                 loop {
-                    let message = conn.inner.stream.recv().await?;
+                    let message = c.conn.inner.stream.recv().await?;
 
                     match message.format {
                     BackendMessageFormat::BindComplete
@@ -325,7 +336,7 @@ impl QueryState {
 
                     BackendMessageFormat::ReadyForQuery => {
                         // processing of the query string is complete
-                        conn.handle_ready_for_query(message)?;
+                        c.conn.handle_ready_for_query(message)?;
                         break;
                     }
 
@@ -344,7 +355,7 @@ impl QueryState {
             PipelineStep::FillCache(query, rx, oids, named_types) => {
                 println!("FillCache");
                 let mut query = query.clone();
-                Box::pin(async { query.next(conn, state).await }).await?;
+                Box::pin(async { query.next(c).await }).await?;
 
                 self.should_flush_before_next = query.should_flush_before_next;
 
@@ -357,7 +368,7 @@ impl QueryState {
                         if let Either::Right(row) = res {
                             let typed_row = FetchByOid::from_row(&row)?;
                             if let Some(ref name) = typed_row.type_name {
-                                conn.inner.cache_type_oid.insert(
+                                c.conn.inner.cache_type_oid.insert(
                                     UStr::Shared(name.clone().into()),
                                     typed_row.fetched_oid,
                                 );
@@ -368,22 +379,23 @@ impl QueryState {
                     }
                     for oid in oids {
                         let ty = recursive_find(&mut rows, *oid).expect("Bug");
-                        conn.inner.cache_type_info.insert(*oid, ty);
+                        c.conn.inner.cache_type_info.insert(*oid, ty);
                     }
 
                     for named in named_types {
-                        let oid = conn
+                        let oid = c
+                            .conn
                             .inner
                             .cache_type_oid
                             .get(&UStr::Shared(named.clone().into()))
                             .copied()
                             .expect("BUG");
                         let ty = recursive_find(&mut rows, oid).expect("Bug");
-                        conn.inner.cache_type_info.insert(oid, ty);
+                        c.conn.inner.cache_type_info.insert(oid, ty);
                     }
                     // dbg!(&conn.inner.cache_type_oid);
                     // dbg!(&conn.inner.cache_type_info);
-                    state.depth -= 1;
+                    c.state.depth -= 1;
                     PipelineStep::ParseDescribe
                 } else {
                     PipelineStep::FillCache(query, rx.clone(), oids.to_vec(), named_types.to_vec())
@@ -396,12 +408,11 @@ impl QueryState {
 
     pub async fn handle_error(
         &mut self,
-        state: &mut PipelineState,
-        conn: &mut PgConnection,
+        context: &mut PipelineContext<'_>,
     ) -> sqlx_core::Result<()> {
-        let _ = state.preparing.remove(&self.sql);
+        let _ = context.state.preparing.remove(&self.sql);
 
-        conn.recv_ready_for_query().await?;
+        context.conn.recv_ready_for_query().await?;
         Ok(())
     }
 }

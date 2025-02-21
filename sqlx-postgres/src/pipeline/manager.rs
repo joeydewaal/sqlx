@@ -1,66 +1,80 @@
-use std::ops::DerefMut;
+use crate::PgConnection;
 
-use super::{
-    flush::FlushManager,
-    state::{PipelineState, QueryState},
-};
-use crate::{PgConnection, PgQueryResult, PgRow, Postgres};
-use sqlx_core::{executor::Execute, Either, Error};
+use super::{context::PipelineContext, state::QueryState};
 
-pub(super) struct PipelineManager<C: DerefMut<Target = PgConnection>> {
-    all_done: bool,
-    conn: C,
-    queries: Vec<Option<QueryState>>,
-    state: PipelineState,
+pub(super) struct JoinManager {
+    has_flushed: bool,
+    all_completed: bool,
 }
 
-impl<'q, C: DerefMut<Target = PgConnection>> PipelineManager<C> {
-    pub(crate) fn new(conn: C) -> PipelineManager<C> {
-        PipelineManager {
-            all_done: false,
-            conn,
-            queries: Vec::new(),
-            state: PipelineState::new(),
+impl JoinManager {
+    pub(super) fn new() -> JoinManager {
+        JoinManager {
+            // Write buffer was flushe this iteration.
+            has_flushed: false,
+            // All queries are executed.
+            all_completed: false,
         }
     }
 
-    pub(crate) fn push(
+    #[inline(always)]
+    pub(super) fn is_done(&self) -> bool {
+        self.all_completed
+    }
+
+    #[inline(always)]
+    pub(super) fn set_not_completed(&mut self) {
+        self.all_completed = false
+    }
+
+    #[inline(always)]
+    pub(super) fn setup(&mut self) {
+        self.has_flushed = false;
+        self.all_completed = true
+    }
+
+    pub(super) async fn handle_next(
         &mut self,
-        mut query: impl Execute<'q, Postgres>,
-    ) -> flume::Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>> {
-        let args = query.take_arguments();
-        // TODO: Arguments
-        let (q_state, rx) = QueryState::new(query.sql().to_string(), args.unwrap().unwrap());
-        self.queries.push(Some(q_state));
-        rx
-    }
+        opt_query: &mut Option<QueryState>,
+        context: &mut PipelineContext<'_>,
+    ) -> sqlx_core::Result<()> {
+        if let Some(query) = opt_query {
+            // Make sure that we get run again.
+            self.set_not_completed();
 
-    pub async fn join(mut self) -> sqlx_core::Result<()> {
-        let conn = self.conn.deref_mut();
-        conn.wait_until_ready().await?;
-        let mut flush_manager = FlushManager::new();
+            // Flush buffer but only if we need to.
+            self.handle_flush(query, context.conn).await?;
 
-        while !self.all_done {
-            flush_manager.reset();
-            let mut all_done = true;
+            // Call the state machine.
+            query.handle_next(context).await?;
 
-            for opt_query in &mut self.queries {
-                if let Some(query) = opt_query {
-                    all_done = false;
-                    flush_manager.handle_flush(query, conn).await?;
-                    query.handle_next(conn, &mut self.state).await?;
-
-                    if query.is_done {
-                        opt_query.take();
-                    }
-                }
+            // Remove the state machine if the query is done.
+            if query.is_done {
+                *opt_query = None;
             }
-
-            if all_done {
-                break;
-            }
+        } else {
+            // Query done executing.
         }
 
+        Ok(())
+    }
+
+    // Flushes the buffer but only if needed. This is only called once per iteration.
+    async fn handle_flush(
+        &mut self,
+        query: &mut QueryState,
+        conn: &mut PgConnection,
+    ) -> sqlx_core::Result<()> {
+        if !self.has_flushed && query.should_flush_before_next {
+            // Flush the write buffer so the database can handle them.
+            conn.inner.stream.flush().await?;
+
+            // Make sure we don't flush again this iteration.
+            self.has_flushed = true;
+        }
+
+        // Reset the flush status for the queries.
+        query.should_flush_before_next = false;
         Ok(())
     }
 }
