@@ -104,6 +104,21 @@ fn get_oid(ty: &PgType, conn: &PgConnection) -> Option<Oid> {
 }
 
 impl QueryState {
+    pub async fn handle_next(
+        &mut self,
+        conn: &mut PgConnection,
+        state: &mut PipelineState,
+    ) -> sqlx_core::Result<()> {
+        let result = self.next(conn, state).await;
+        if let Err(result) = result {
+            self.handle_error(state, conn).await?;
+            self.is_done = true;
+            dbg!(&result);
+            let _ = self.sender.send(Some(Err(result)));
+        }
+        Ok(())
+    }
+
     pub async fn next(
         &mut self,
         conn: &mut PgConnection,
@@ -159,8 +174,8 @@ impl QueryState {
 
                     let mut arguments = PgArguments::default();
 
-                    arguments.add(&unresolved_oids).unwrap();
-                    arguments.add(&unresolved_typ).unwrap();
+                    arguments.add(&unresolved_oids).map_err(Error::Encode)?;
+                    arguments.add(&unresolved_typ).map_err(Error::Encode)?;
 
                     state.depth += 1;
                     let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);

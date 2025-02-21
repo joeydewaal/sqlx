@@ -63,7 +63,7 @@ pub use transaction::PgTransactionManager;
 pub use type_info::{PgTypeInfo, PgTypeKind};
 pub use types::PgHasArrayType;
 pub use value::{PgValue, PgValueFormat, PgValueRef};
-pub use pipeline::Pipeline;
+pub use pipeline::PgPipeline;
 
 /// An alias for [`Pool`][crate::pool::Pool], specialized for Postgres.
 pub type PgPool = crate::pool::Pool<Postgres>;
