@@ -4,7 +4,6 @@ use super::{context::PipelineContext, state::QueryState};
 
 pub(super) struct JoinManager {
     has_flushed: bool,
-    all_completed: bool,
 }
 
 impl JoinManager {
@@ -12,25 +11,12 @@ impl JoinManager {
         JoinManager {
             // Write buffer was flushe this iteration.
             has_flushed: false,
-            // All queries are executed.
-            all_completed: false,
         }
-    }
-
-    #[inline(always)]
-    pub(super) fn all_completed(&self) -> bool {
-        self.all_completed
-    }
-
-    #[inline(always)]
-    pub(super) fn set_not_completed(&mut self) {
-        self.all_completed = false
     }
 
     #[inline(always)]
     pub(super) fn setup(&mut self) {
         self.has_flushed = false;
-        self.all_completed = true
     }
 
     pub(super) async fn handle_next(
@@ -48,12 +34,7 @@ impl JoinManager {
             if query.is_done {
                 // Remove the state machine if the query is done.
                 *opt_query = None;
-            } else {
-                // If we are not done, make sure that we get run again.
-                self.set_not_completed();
             }
-        } else {
-            // Query done executing.
         }
 
         Ok(())

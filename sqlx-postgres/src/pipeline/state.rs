@@ -1,12 +1,12 @@
-use futures_util::{stream::StreamExt, TryStreamExt};
+use futures_util::stream::StreamExt;
 use std::{collections::HashSet, sync::Arc};
 
 use flume::Receiver;
-use sqlx_core::{ext::ustr::UStr, logger::QueryLogger, Either, Error};
+use sqlx_core::{ext::ustr::UStr, Either, Error};
 
 use crate::{
     io::{PortalId, StatementId},
-    message::{self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, Parse},
+    message::{self, Bind, Close, Parse},
     pipeline::cache::{recursive_find, FetchByOid},
     statement::PgStatementMetadata,
     type_info::PgType,
@@ -209,7 +209,6 @@ impl QueryState {
     }
 
     pub async fn next(&mut self, context: &mut PipelineContext<'_>) -> sqlx_core::Result<()> {
-        print!(" - {}", context.state.depth);
         self.next_step = match &mut self.next_step {
             PipelineStep::GetOrPrepare => {
                 println!("GetOrPrepare");

@@ -123,7 +123,7 @@ impl PgStream {
     pub(crate) async fn recv(&mut self) -> Result<ReceivedMessage, Error> {
         loop {
             let message = self.recv_unchecked().await?;
-            println!("INFO: {:?}", &message.format);
+            // println!("INFO: {:?}", &message.format);
 
             match message.format {
                 BackendMessageFormat::ErrorResponse => {

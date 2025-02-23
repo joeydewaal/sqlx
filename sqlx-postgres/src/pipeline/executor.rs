@@ -1,26 +1,18 @@
-use crate::{
-    describe::Describe, PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres,
-};
-use std::{fmt::Debug, ops::DerefMut};
-
+use crate::{describe::Describe, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
 use futures_core::{future::BoxFuture, stream::BoxStream};
 use sqlx_core::{
     executor::{Execute, Executor},
     Either, Error,
 };
 
-use super::PgPipeline;
+use super::{state::QueryState, PgPipeline};
 
-pub(super) const ERROR_MSG: &'static str = "BUG: Pipeline::join cannot be called multiple times";
-
-impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
-    for &'c PgPipeline<C>
-{
+impl<'c> Executor<'c> for &'c PgPipeline {
     type Database = Postgres;
 
     fn fetch_many<'e, 'q, E>(
         self,
-        query: E,
+        mut query: E,
     ) -> BoxStream<'e, Result<Either<PgQueryResult, PgRow>, Error>>
     where
         'c: 'e,
@@ -28,10 +20,11 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
         'q: 'e,
         E: 'q,
     {
-        let mut lock = self.lock();
-        let pipeline = Option::as_mut(&mut lock).expect(ERROR_MSG);
+        let args = query.take_arguments();
 
-        let rx = pipeline.push(query);
+        // TODO: Arguments
+        let (q_state, rx) = QueryState::new(query.sql().to_string(), args.unwrap().unwrap());
+        let _ = self.tx.send(super::worker::Command::Query(q_state));
 
         Box::pin(try_stream! {
             while let Ok(Some(v)) = rx.recv_async().await {
@@ -43,17 +36,18 @@ impl<'c, C: Send + Debug + Sync + DerefMut<Target = PgConnection>> Executor<'c>
         })
     }
 
-    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<PgRow>, Error>>
+    fn fetch_optional<'e, 'q, E>(self, mut query: E) -> BoxFuture<'e, Result<Option<PgRow>, Error>>
     where
         'c: 'e,
         E: Execute<'q, Self::Database>,
         'q: 'e,
         E: 'q,
     {
-        let mut lock = self.lock();
-        let pipeline = Option::as_mut(&mut lock).expect(ERROR_MSG);
-        let rx = pipeline.push(query);
+        let args = query.take_arguments();
 
+        // TODO: Arguments
+        let (q_state, rx) = QueryState::new(query.sql().to_string(), args.unwrap().unwrap());
+        let _ = self.tx.send(super::worker::Command::Query(q_state));
         Box::pin(async move {
             let mut ret = None;
             while let Ok(Some(result)) = rx.recv_async().await {

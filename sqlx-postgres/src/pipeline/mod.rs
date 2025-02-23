@@ -1,21 +1,14 @@
-use crate::{PgConnection, PgQueryResult, PgRow, Postgres};
-use context::PipelineContext;
-use manager::JoinManager;
-use sqlx_core::{executor::Execute, Either, Error};
-use state::QueryState;
-use std::{
-    fmt::Debug,
-    ops::DerefMut,
-    sync::{Mutex, MutexGuard},
-};
-
-use executor::ERROR_MSG;
+use crate::PgConnection;
+use flume::Sender;
+use std::fmt::Debug;
+use worker::{Command, PipelineWorker};
 
 mod cache;
 mod context;
 mod executor;
 mod manager;
 mod state;
+mod worker;
 
 // Parse -> Bind -> Execute -> Close
 
@@ -47,76 +40,28 @@ mod state;
 //
 // 3. Push Bind with portal, and args + execute
 
-pub struct PgPipeline<C: DerefMut<Target = PgConnection>> {
-    inner: Mutex<Option<MutableInner<C>>>,
+pub struct PgPipeline {
+    tx: Sender<Command>,
 }
 
-impl<C: Debug + DerefMut<Target = PgConnection>> Debug for PgPipeline<C> {
+impl Debug for PgPipeline {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // FIXME give better debug msg
         write!(f, "PgPipeline")
     }
 }
 
-impl<C: DerefMut<Target = PgConnection>> PgPipeline<C> {
-    pub fn new(conn: C) -> Self {
-        Self {
-            inner: Mutex::new(Some(MutableInner::new(conn))),
-        }
+impl PgPipeline {
+    pub fn new(conn: PgConnection) -> Self {
+        let (tx, worker) = PipelineWorker::new(conn);
+        worker.spawn();
+        Self { tx }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Option<MutableInner<C>>> {
-        self.inner.lock().expect("Could not get `Pipeline` lock")
-    }
-
-    pub async fn join(&self) -> sqlx_core::Result<()> {
-        let lock = self.lock().take().expect(ERROR_MSG);
-        lock.join().await
-    }
-}
-
-pub(super) struct MutableInner<C: DerefMut<Target = PgConnection>> {
-    conn: C,
-    queries: Vec<Option<QueryState>>,
-}
-
-impl<'q, C: DerefMut<Target = PgConnection>> MutableInner<C> {
-    pub(crate) fn new(conn: C) -> MutableInner<C> {
-        MutableInner {
-            conn,
-            queries: Vec::new(),
-        }
-    }
-
-    pub(crate) fn push(
-        &mut self,
-        mut query: impl Execute<'q, Postgres>,
-    ) -> flume::Receiver<Option<Result<Either<PgQueryResult, PgRow>, Error>>> {
-        let args = query.take_arguments();
-        // TODO: Arguments
-        let (q_state, rx) = QueryState::new(query.sql().to_string(), args.unwrap().unwrap());
-        self.queries.push(Some(q_state));
-        rx
-    }
-
-    pub async fn join(mut self) -> sqlx_core::Result<()> {
-        // Manages the queries.
-        let mut join_manager = JoinManager::new();
-
-        // Holds the connection + state shared between queries.
-        let mut context = PipelineContext::new(self.conn.deref_mut());
-
-        // Make sure we are ready. Flush out the buffer, etc.
-        context.wait_until_ready().await?;
-
-        while !join_manager.all_completed() {
-            join_manager.setup();
-
-            for opt_query in &mut self.queries {
-                join_manager.handle_next(opt_query, &mut context).await?;
-            }
-        }
-
-        Ok(())
+    pub async fn close(self) -> sqlx_core::Result<PgConnection> {
+        let (tx, rx) = flume::bounded(1);
+        let _ = self.tx.send(Command::Close(tx));
+        let conn = rx.recv_async().await.unwrap();
+        Ok(conn)
     }
 }
