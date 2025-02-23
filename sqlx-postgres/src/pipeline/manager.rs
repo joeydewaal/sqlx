@@ -59,3 +59,30 @@ impl JoinManager {
         Ok(())
     }
 }
+
+pub(super) struct QueryManager {
+    queries: Vec<Option<QueryState>>,
+}
+
+impl QueryManager {
+    pub(crate) fn new() -> QueryManager {
+        QueryManager {
+            queries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, query: QueryState) {
+        self.queries.push(Some(query));
+    }
+
+    pub(crate) async fn handle_next<'c>(
+        &mut self,
+        context: &mut PipelineContext<'c>,
+        join_manager: &mut JoinManager,
+    ) {
+        for opt_query in &mut self.queries {
+            join_manager.handle_next(opt_query, context).await.unwrap();
+            sqlx_core::rt::yield_now().await;
+        }
+    }
+}
