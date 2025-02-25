@@ -182,13 +182,16 @@ where
 
     /// Execute the query and return the total number of rows affected.
     #[inline]
-    pub async fn execute<'e, 'c: 'e, E>(self, executor: E) -> Result<DB::QueryResult, Error>
+    pub fn execute<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<DB::QueryResult, Error>> + 'e
     where
         'q: 'e,
         A: 'e,
         E: Executor<'c, Database = DB>,
     {
-        executor.execute(self).await
+        executor.execute(self)
     }
 
     /// Execute multiple queries and return the rows affected from each query, in a stream.
@@ -244,13 +247,16 @@ where
     /// To avoid exhausting available memory, ensure the result set has a known upper bound,
     /// e.g. using `LIMIT`.
     #[inline]
-    pub async fn fetch_all<'e, 'c: 'e, E>(self, executor: E) -> Result<Vec<DB::Row>, Error>
+    pub fn fetch_all<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<Vec<DB::Row>, Error>> + 'e
     where
         'q: 'e,
         A: 'e,
         E: Executor<'c, Database = DB>,
     {
-        executor.fetch_all(self).await
+        executor.fetch_all(self)
     }
 
     /// Execute the query, returning the first row or [`Error::RowNotFound`] otherwise.
@@ -266,13 +272,16 @@ where
     ///
     /// Otherwise, you might want to add `LIMIT 1` to your query.
     #[inline]
-    pub async fn fetch_one<'e, 'c: 'e, E>(self, executor: E) -> Result<DB::Row, Error>
+    pub fn fetch_one<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<DB::Row, Error>> + 'e
     where
         'q: 'e,
         A: 'e,
         E: Executor<'c, Database = DB>,
     {
-        executor.fetch_one(self).await
+        executor.fetch_one(self)
     }
 
     /// Execute the query, returning the first row or `None` otherwise.

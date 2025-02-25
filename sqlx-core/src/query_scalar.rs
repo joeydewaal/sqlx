@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use either::Either;
 use futures_core::stream::BoxStream;
 use futures_util::{StreamExt, TryFutureExt, TryStreamExt};
@@ -126,7 +128,10 @@ where
     /// To avoid exhausting available memory, ensure the result set has a known upper bound,
     /// e.g. using `LIMIT`.
     #[inline]
-    pub async fn fetch_all<'e, 'c: 'e, E>(self, executor: E) -> Result<Vec<O>, Error>
+    pub fn fetch_all<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<Vec<O>, Error>> + 'e
     where
         'q: 'e,
         E: 'e + Executor<'c, Database = DB>,
@@ -134,11 +139,9 @@ where
         (O,): 'e,
         A: 'e,
     {
-        self.inner
-            .fetch(executor)
-            .map_ok(|it| it.0)
-            .try_collect()
-            .await
+        let fut = self.inner.fetch(executor).map_ok(|it| it.0).try_collect();
+
+        async { fut.await }
     }
 
     /// Execute the query, returning the first row or [`Error::RowNotFound`] otherwise.
@@ -154,7 +157,10 @@ where
     ///
     /// Otherwise, you might want to add `LIMIT 1` to your query.
     #[inline]
-    pub async fn fetch_one<'e, 'c: 'e, E>(self, executor: E) -> Result<O, Error>
+    pub fn fetch_one<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<O, Error>> + 'e
     where
         'q: 'e,
         E: 'e + Executor<'c, Database = DB>,
@@ -162,7 +168,8 @@ where
         O: 'e,
         A: 'e,
     {
-        self.inner.fetch_one(executor).map_ok(|it| it.0).await
+        let fut = self.inner.fetch_one(executor).map_ok(|it| it.0);
+        async { fut.await }
     }
 
     /// Execute the query, returning the first row or `None` otherwise.
@@ -178,7 +185,10 @@ where
     ///
     /// Otherwise, you might want to add `LIMIT 1` to your query.
     #[inline]
-    pub async fn fetch_optional<'e, 'c: 'e, E>(self, executor: E) -> Result<Option<O>, Error>
+    pub fn fetch_optional<'e, 'c: 'e, E>(
+        self,
+        executor: E,
+    ) -> impl Future<Output = Result<Option<O>, Error>> + 'e
     where
         'q: 'e,
         E: 'e + Executor<'c, Database = DB>,
@@ -186,7 +196,8 @@ where
         O: 'e,
         A: 'e,
     {
-        Ok(self.inner.fetch_optional(executor).await?.map(|it| it.0))
+        let fut = self.inner.fetch_optional(executor);
+        async { Ok(fut.await?.map(|it| it.0)) }
     }
 }
 

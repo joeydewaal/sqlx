@@ -123,7 +123,6 @@ impl<S: Socket> BufferedSocket<S> {
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
-        println!("--------------------flushing----------------------");
         while !self.write_buf.is_empty() {
             let written = self.socket.write(self.write_buf.get()).await?;
             self.write_buf.consume(written);
