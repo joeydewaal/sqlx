@@ -1,5 +1,7 @@
 use crate::PgConnection;
 use flume::Sender;
+use futures::TryFutureExt;
+use sqlx_core::Error;
 use std::fmt::Debug;
 use worker::{Command, PipelineWorker};
 
@@ -60,8 +62,11 @@ impl PgPipeline {
 
     pub async fn close(self) -> sqlx_core::Result<PgConnection> {
         let (tx, rx) = flume::bounded(1);
-        let _ = self.tx.send(Command::Close(tx));
-        let conn = rx.recv_async().await.unwrap();
+        self.tx
+            .send(Command::Close(tx))
+            .map_err(|_| Error::WorkerCrashed)?;
+
+        let conn = rx.recv_async().map_err(|_| Error::WorkerCrashed).await?;
         Ok(conn)
     }
 }

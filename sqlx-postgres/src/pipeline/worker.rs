@@ -26,7 +26,10 @@ impl PipelineWorker {
     async fn main_loop(mut self) {
         // TODO
         let mut context = PipelineContext::new(&mut self.conn);
-        context.wait_until_ready().await.unwrap();
+        if let Err(e) = context.wait_until_ready().await {
+            tracing::error!(?e);
+            return;
+        };
 
         let mut join_manager = JoinManager::new();
 
@@ -34,14 +37,17 @@ impl PipelineWorker {
 
         loop {
             join_manager.setup();
-            futures::select! {
+            futures::select_biased! {
                 message = self.rx.recv_async().fuse() => {
                     let Ok(message) = message else {
                         break;
                     };
                     match message {
                         Command::Close(tx) => {
-                            context.wait_until_ready().await.unwrap();
+                            if let Err(e) = context.wait_until_ready().await {
+                                tracing::error!(?e);
+                                return;
+                            };
                             let _ = tx.send(self.conn);
                             return;
                         },

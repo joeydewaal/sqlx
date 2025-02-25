@@ -226,11 +226,10 @@ impl PgConnection {
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
-        let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
         // before we continue, wait until we are "ready" to accept more queries
         self.wait_until_ready().await?;
 
-        let mut metadata: Arc<PgStatementMetadata>;
+        let metadata: Arc<PgStatementMetadata>;
 
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.

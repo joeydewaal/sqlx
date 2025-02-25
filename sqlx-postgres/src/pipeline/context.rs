@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     io::StatementId,
@@ -8,18 +8,18 @@ use crate::{
     PgConnection,
 };
 
-use super::state::PipelineState;
-
 // Holds the connection and state that is shared between queries.
 pub(super) struct PipelineContext<'c> {
-    pub(super) state: PipelineState,
+    pub(super) depth: usize,
+    pub(super) preparing: HashSet<String>,
     pub(super) conn: &'c mut PgConnection,
 }
 
 impl<'c> PipelineContext<'c> {
     pub(super) fn new(conn: &'c mut PgConnection) -> PipelineContext<'c> {
         Self {
-            state: PipelineState::new(),
+            preparing: HashSet::new(),
+            depth: 0,
             conn,
         }
     }
@@ -28,6 +28,7 @@ impl<'c> PipelineContext<'c> {
         self.conn.wait_until_ready().await
     }
 
+    #[inline(always)]
     pub(super) fn get_prepared(
         &mut self,
         sql: &str,
@@ -39,12 +40,14 @@ impl<'c> PipelineContext<'c> {
             .map(|(stmt_id, meta)| (*stmt_id, meta.clone()))
     }
 
+    #[inline(always)]
     pub(super) fn is_preparing_this_iter(&self, sql: &str) -> bool {
-        self.state.preparing.contains(sql)
+        self.preparing.contains(sql)
     }
 
+    #[inline(always)]
     pub(super) fn register_prepare(&mut self, sql: String) {
-        self.state.preparing.insert(sql);
+        self.preparing.insert(sql);
     }
 
     pub(super) fn next_stmt_id(&mut self) -> StatementId {
@@ -100,7 +103,7 @@ impl<'c> PipelineContext<'c> {
 
         // Remove query from the shared cache, it is now cached so queries that are waiting can use
         // it.
-        self.state.preparing.remove(sql);
+        self.preparing.remove(sql);
         Ok(())
     }
 }

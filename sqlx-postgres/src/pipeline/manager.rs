@@ -9,7 +9,7 @@ pub(super) struct JoinManager {
 impl JoinManager {
     pub(super) fn new() -> JoinManager {
         JoinManager {
-            // Write buffer was flushe this iteration.
+            // Write buffer was flushed this iteration.
             has_flushed: false,
         }
     }
@@ -41,13 +41,14 @@ impl JoinManager {
     }
 
     // Flushes the buffer but only if needed. This is only called once per iteration.
+    #[inline]
     async fn handle_flush(
         &mut self,
         query: &mut QueryState,
         conn: &mut PgConnection,
     ) -> sqlx_core::Result<()> {
+        // Only flush the buffer if it hasn't been flushed this iteration and is needed.
         if !self.has_flushed && query.should_flush_before_next {
-            // Flush the write buffer so the database can handle them.
             conn.inner.stream.flush().await?;
 
             // Make sure we don't flush again this iteration.
@@ -71,18 +72,20 @@ impl QueryManager {
         }
     }
 
+    #[inline]
     pub(crate) fn push(&mut self, query: QueryState) {
         self.queries.push(Some(query));
     }
 
+    #[inline]
     pub(crate) async fn handle_next<'c>(
         &mut self,
         context: &mut PipelineContext<'c>,
         join_manager: &mut JoinManager,
     ) {
+        println!("iteration");
         for opt_query in &mut self.queries {
             join_manager.handle_next(opt_query, context).await.unwrap();
-            sqlx_core::rt::yield_now().await;
         }
     }
 }

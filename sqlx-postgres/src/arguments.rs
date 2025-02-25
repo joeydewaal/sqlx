@@ -127,7 +127,6 @@ impl PgArguments {
         }
 
         for (offset, kind) in type_holes {
-            println!("fetching");
             let oid = match kind {
                 HoleKind::Type { name } => conn.fetch_type_id_by_name(name).await?,
                 HoleKind::Array(array) => conn.fetch_array_type_id(array).await?,

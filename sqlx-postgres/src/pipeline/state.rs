@@ -1,5 +1,5 @@
 use futures_util::stream::StreamExt;
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use flume::Receiver;
 use sqlx_core::{ext::ustr::UStr, Either, Error};
@@ -15,20 +15,6 @@ use crate::{
 };
 
 use super::context::PipelineContext;
-
-pub struct PipelineState {
-    depth: usize,
-    pub(super) preparing: HashSet<String>,
-}
-
-impl PipelineState {
-    pub fn new() -> Self {
-        Self {
-            preparing: HashSet::new(),
-            depth: 0,
-        }
-    }
-}
 
 // Holds the state machine and data needed to execute a query.
 #[derive(Clone)]
@@ -62,6 +48,13 @@ impl QueryState {
             rx,
         )
     }
+
+    async fn handle_error(&self) -> sqlx_core::Result<()> {
+        match &self.next_step {
+            PipelineStep::FillCache(q, _, _, _) => Box::pin(q.handle_error()).await,
+            _ => Ok(()),
+        }
+    }
 }
 
 // All the states needed to execute a prepared statement.
@@ -84,16 +77,17 @@ pub enum PipelineStep {
     // Receives `ParseComplete` for the `Parse` message, `ParameterDescription` and
     // `RowDescription` for the `Describe` message.
     //
-    // Lookup types in the rows in cache.
+    // Lookup (custom) types in the rows in cache.
     // -> If they are not cached, go to `FillCache` and look them up.
     // -> If all the types are in cache/known, go to `BindExecuteClose`
     ReceiveParseDescribe(StatementId),
 
     // Push a `Bind`, `Execute`, `Close` and `Sync` message in the write buffer. This step executes
-    // the query. After this Postgres sends back rows. Go to `ReceiveData` to receive the data.
+    // the query. After this Postgres sends back data rows. Go to `ReceiveData` to receive the data.
     BindExecuteClose(StatementId, Arc<PgStatementMetadata>),
 
-    // Receives the data.
+    // Receives the data rows. After this the query is done executing After this the query is done
+    // executing.
     ReceiveData(Arc<PgStatementMetadata>),
 
     // This step fetches the given Oids and named types and stores them in cache.
@@ -135,12 +129,14 @@ impl QueryState {
         &mut self,
         context: &mut PipelineContext<'_>,
     ) -> sqlx_core::Result<()> {
-        let result = self.next(context).await;
-        if let Err(result) = result {
-            self.handle_error(context).await?;
+        if let Err(err) = self.next(context).await {
+            // Remove the query from the actively preparing queries.
+            let _ = context.preparing.remove(&self.sql);
+
+            self.handle_error().await?;
+
             self.is_done = true;
-            dbg!(&result);
-            let _ = self.sender.send(Some(Err(result)));
+            let _ = self.sender.send(Some(Err(err)));
         }
         Ok(())
     }
@@ -152,7 +148,6 @@ impl QueryState {
         oids: &[Oid],
         stmt_id: StatementId,
     ) -> sqlx_core::Result<()> {
-        println!("Pushing Parse");
         conn.inner.stream.write_msg(Parse {
             param_types: &oids,
             query: &self.sql,
@@ -166,7 +161,6 @@ impl QueryState {
         conn: &mut PgConnection,
         stmt_id: StatementId,
     ) -> sqlx_core::Result<()> {
-        println!("Pushing Describe");
         conn.inner
             .stream
             .write_msg(message::Describe::Statement(stmt_id))
@@ -203,15 +197,13 @@ impl QueryState {
 
     #[inline(always)]
     fn write_close_into(&self, conn: &mut PgConnection, portal: PortalId) -> sqlx_core::Result<()> {
-        conn.inner
-            .stream
-            .write_msg(Close::Portal(PortalId::UNNAMED))
+        conn.inner.stream.write_msg(Close::Portal(portal))
     }
 
     pub async fn next(&mut self, context: &mut PipelineContext<'_>) -> sqlx_core::Result<()> {
         self.next_step = match &mut self.next_step {
             PipelineStep::GetOrPrepare => {
-                println!("GetOrPrepare");
+                // println!("GetOrPrepare");
 
                 if let Some((stmt_id, meta)) = context.get_prepared(&self.sql) {
                     // If this statement is prepared, go and execute it.
@@ -221,6 +213,8 @@ impl QueryState {
                     // again next iteration.
                     PipelineStep::GetOrPrepare
                 } else {
+                    // Else we need to prepare the query.
+
                     // Make sure we don't prepare this query again this iteration.
                     context.register_prepare(self.sql.clone());
                     PipelineStep::ParseDescribe
@@ -260,20 +254,22 @@ impl QueryState {
                     arguments.add(&unresolved_oids).map_err(Error::Encode)?;
                     arguments.add(&unresolved_typ).map_err(Error::Encode)?;
 
-                    context.state.depth += 1;
+                    context.depth += 1;
                     let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);
                     PipelineStep::FillCache(Box::new(q_state), rx, unresolved_oids, unresolved_typ)
                 } else {
                     // All oid of arguments (Domain, Composite,...) are fetched and in cache. This
                     // query is ready to be prepared.
 
-                    // Write a `Parse` message.
+                    // Write a `Parse` message. This prepares the query.
                     self.write_parse_into(&mut context.conn, &oids, stmt_id)?;
 
-                    // Write a `Describe` message.
+                    // Write a `Describe` message, this gives info about the prepared statement so
+                    // SQLx knows how to interpered the data rows.
                     self.write_describe_into(&mut context.conn, stmt_id)?;
 
-                    // Write a `Sync` message.
+                    // Write a `Sync` message. This makes sure that we get a response on the next
+                    // iteration.
                     context.conn.write_sync();
 
                     // Apply patches that are needed to the given arguments. This should NEVER
@@ -283,6 +279,7 @@ impl QueryState {
                         .await?;
 
                     // To ensure we get a response from Postgres we should flush the buffer before
+                    // the next state is executed.
                     self.should_flush_before_next = true;
 
                     PipelineStep::ReceiveParseDescribe(stmt_id)
@@ -322,7 +319,8 @@ impl QueryState {
                     arguments.add(&unresolved_oids).map_err(Error::Encode)?;
                     arguments.add(&[""; 0]).map_err(Error::Encode)?;
 
-                    context.state.depth += 1;
+                    context.depth += 1;
+                    println!("Unresolved oids: {unresolved_oids:?}");
                     let (q_state, rx) = QueryState::new(SQL.to_string(), arguments);
                     PipelineStep::FillCache(Box::new(q_state), rx, unresolved_oids, Vec::new())
                 } else {
@@ -344,19 +342,18 @@ impl QueryState {
                 }
             }
             PipelineStep::BindExecuteClose(stmt_id, param) => {
-                let param = param.clone();
                 println!("BindExecuteClose");
-                println!("Writing BIND");
+                let param = param.clone();
 
                 // Write a `Bind` message into the buffer with the arguments.
                 let stmt = *stmt_id;
                 self.write_bind_into(context.conn, stmt, PortalId::UNNAMED)?;
 
-                println!("Writing EXECUTE");
+                // println!("Writing EXECUTE");
                 // Write an `Execute` message into the buffer to execute the prepared statement.
                 self.write_execute_into(context.conn, PortalId::UNNAMED, 0)?;
 
-                println!("Writing CLOSE");
+                // println!("Writing CLOSE");
                 // Write a `Close` message to close the open portal.
                 self.write_close_into(context.conn, PortalId::UNNAMED)?;
 
@@ -379,7 +376,6 @@ impl QueryState {
                 while let Some(value) = stream.next().await {
                     if self.sender.send(Some(value)).is_err() {
                         self.is_done = true;
-                        return Ok(());
                     };
                 }
                 let _ = self.sender.send(None);
@@ -388,8 +384,7 @@ impl QueryState {
             }
             PipelineStep::FillCache(query, rx, oids, named_types) => {
                 println!("FillCache");
-                let mut query = query.clone();
-                Box::pin(async { query.next(context).await }).await?;
+                Box::pin(query.next(context)).await?;
 
                 self.should_flush_before_next = query.should_flush_before_next;
 
@@ -427,24 +422,20 @@ impl QueryState {
                     }
                     // dbg!(&conn.inner.cache_type_oid);
                     // dbg!(&conn.inner.cache_type_info);
-                    context.state.depth -= 1;
+                    context.depth -= 1;
                     PipelineStep::ParseDescribe
                 } else {
-                    PipelineStep::FillCache(query, rx.clone(), oids.to_vec(), named_types.to_vec())
+                    println!("Here");
+                    PipelineStep::FillCache(
+                        query.clone(),
+                        rx.clone(),
+                        oids.to_vec(),
+                        named_types.to_vec(),
+                    )
                 }
             }
         };
 
-        Ok(())
-    }
-
-    pub async fn handle_error(
-        &mut self,
-        context: &mut PipelineContext<'_>,
-    ) -> sqlx_core::Result<()> {
-        let _ = context.state.preparing.remove(&self.sql);
-
-        context.conn.recv_ready_for_query().await?;
         Ok(())
     }
 }
