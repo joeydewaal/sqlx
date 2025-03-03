@@ -199,6 +199,14 @@ impl MySqlConnection {
                     needs_metadata = true;
 
                     recv_result_columns(&mut self.inner.stream, num_columns, Arc::make_mut(&mut columns)).await?;
+
+                    // https://github.com/launchbadge/sqlx/issues/1530
+                    if column_names.is_empty() && num_columns != 0 {
+                        let col_names = Arc::make_mut(&mut column_names);
+                        for ordinal in 0..num_columns {
+                            col_names.insert(columns[ordinal].name.clone(), ordinal);
+                        }
+                    }
                 }
 
                 // finally, there will be none or many result-rows
