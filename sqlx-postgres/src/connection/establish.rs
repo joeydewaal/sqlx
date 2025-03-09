@@ -1,3 +1,5 @@
+use futures_util::SinkExt as _;
+
 use crate::HashMap;
 
 use crate::common::StatementCache;
@@ -5,10 +7,12 @@ use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
 use crate::io::StatementId;
 use crate::message::{
-    Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
+    Authentication, BackendKeyData, BackendMessageFormat, EncodeMessage, Password, ReadyForQuery,
+    Startup,
 };
 use crate::{PgConnectOptions, PgConnection};
 
+use super::reactor::{IoRequestBuilder, Reactor};
 use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
@@ -18,6 +22,10 @@ impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
         let mut stream = PgStream::connect(options).await?;
+
+        let stream_bg = PgStream::connect(options).await?;
+
+        let mut chan = Reactor::spawn(stream_bg);
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
@@ -45,6 +53,16 @@ impl PgConnection {
             params.push(("options", options));
         }
 
+        let mut message = IoRequestBuilder::new();
+
+        message.write(Startup {
+            username: Some(&options.username),
+            database: options.database.as_deref(),
+            params: &params,
+        })?;
+
+        let _ = chan.send(message).await;
+
         stream.write(Startup {
             username: Some(&options.username),
             database: options.database.as_deref(),
@@ -63,7 +81,7 @@ impl PgConnection {
         let transaction_status;
 
         loop {
-            let message = stream.recv().await?;
+            let message = chan.recv().await?;
             match message.format {
                 BackendMessageFormat::Authentication => match message.decode()? {
                     Authentication::Ok => {
@@ -75,30 +93,44 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        stream
-                            .send(Password::Cleartext(
-                                options.password.as_deref().unwrap_or_default(),
-                            ))
-                            .await?;
-                    }
+                        // stream
+                        //     .send(Password::Cleartext(
+                        //         options.password.as_deref().unwrap_or_default(),
+                        //     ))
+                        //     .await?;
+                        let mut message = IoRequestBuilder::new();
 
+                        message.write(EncodeMessage(Password::Cleartext(
+                            options.password.as_deref().unwrap_or_default(),
+                        )))?;
+
+                        let _ = chan.send(message).await;
+                    }
                     Authentication::Md5Password(body) => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
+                        let mut message = IoRequestBuilder::new();
+                        message.write(EncodeMessage(Password::Md5 {
+                            username: &options.username,
+                            password: options.password.as_deref().unwrap_or_default(),
+                            salt: body.salt,
+                        }))?;
 
-                        stream
-                            .send(Password::Md5 {
-                                username: &options.username,
-                                password: options.password.as_deref().unwrap_or_default(),
-                                salt: body.salt,
-                            })
-                            .await?;
+                        let _ = chan.send(message).await;
+
+                        // stream
+                        //     .send(Password::Md5 {
+                        //         username: &options.username,
+                        //         password: options.password.as_deref().unwrap_or_default(),
+                        //         salt: body.salt,
+                        //     })
+                        //     .await?;
                     }
 
                     Authentication::Sasl(body) => {
-                        sasl::authenticate(&mut stream, options, body).await?;
+                        sasl::authenticate(&mut chan, &mut stream, options, body).await?;
                     }
 
                     method => {
@@ -122,6 +154,7 @@ impl PgConnection {
                 BackendMessageFormat::ReadyForQuery => {
                     // start-up is completed. The frontend can now issue commands
                     transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
+                    println!("Waited for rfq");
 
                     break;
                 }
@@ -137,6 +170,7 @@ impl PgConnection {
 
         Ok(PgConnection {
             inner: Box::new(PgConnectionInner {
+                chan,
                 stream,
                 process_id,
                 secret_key,
