@@ -28,7 +28,7 @@ use crate::{PgConnectOptions, PgDatabaseError, PgSeverity};
 pub struct PgStream {
     // A trait object is okay here as the buffering amortizes the overhead of both the dynamic
     // function call as well as the syscall.
-    inner: BufferedSocket<Box<dyn Socket>>,
+    pub inner: BufferedSocket<Box<dyn Socket>>,
 
     // buffer of unreceived notification messages from `PUBLISH`
     // this is set when creating a PgListener and only written to if that listener is

@@ -3,8 +3,10 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use crate::HashMap;
+use futures_channel::mpsc::Sender;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
+use reactor::{IoRequest, ReactorSender};
 
 use crate::common::StatementCache;
 use crate::error::Error;
@@ -26,6 +28,7 @@ pub use self::stream::PgStream;
 pub(crate) mod describe;
 mod establish;
 mod executor;
+mod reactor;
 mod sasl;
 mod stream;
 mod tls;
@@ -38,6 +41,8 @@ pub struct PgConnection {
 }
 
 pub struct PgConnectionInner {
+    pub(crate) chan: ReactorSender,
+
     // underlying TCP or UDS stream,
     // wrapped in a potentially TLS stream,
     // wrapped in a buffered stream
@@ -98,10 +103,18 @@ impl PgConnection {
         Ok(())
     }
 
-    async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
-        let r: ReadyForQuery = self.inner.stream.recv_expect().await?;
+    async fn recv_ready_for_query_chan(&mut self) -> Result<(), Error> {
+        println!("expect rfq");
+        let r: ReadyForQuery = self.inner.chan.recv_expect().await?;
 
-        self.inner.pending_ready_for_query_count -= 1;
+        self.inner.transaction_status = r.transaction_status;
+
+        Ok(())
+    }
+    async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
+        let r: ReadyForQuery = self.inner.chan.recv_expect().await?;
+
+        // self.inner.pending_ready_for_query_count -= 1;
         self.inner.transaction_status = r.transaction_status;
 
         Ok(())

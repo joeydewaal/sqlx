@@ -1,6 +1,8 @@
 use crate::connection::stream::PgStream;
 use crate::error::Error;
-use crate::message::{Authentication, AuthenticationSasl, SaslInitialResponse, SaslResponse};
+use crate::message::{
+    Authentication, AuthenticationSasl, EncodeMessage, SaslInitialResponse, SaslResponse,
+};
 use crate::PgConnectOptions;
 use hmac::{Hmac, Mac};
 use rand::Rng;
@@ -9,6 +11,8 @@ use stringprep::saslprep;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 
+use super::reactor::{IoRequest, IoRequestBuilder, ReactorSender};
+
 const GS2_HEADER: &str = "n,,";
 const CHANNEL_ATTR: &str = "c";
 const USERNAME_ATTR: &str = "n";
@@ -16,6 +20,7 @@ const CLIENT_PROOF_ATTR: &str = "p";
 const NONCE_ATTR: &str = "r";
 
 pub(crate) async fn authenticate(
+    chan: &mut ReactorSender,
     stream: &mut PgStream,
     options: &PgConnectOptions,
     data: AuthenticationSasl,
@@ -67,14 +72,23 @@ pub(crate) async fn authenticate(
 
     let client_first_message = format!("{GS2_HEADER}{client_first_message_bare}");
 
-    stream
-        .send(SaslInitialResponse {
-            response: &client_first_message,
-            plus: false,
-        })
-        .await?;
+    let mut message = IoRequestBuilder::new();
+    message.write(EncodeMessage(SaslInitialResponse {
+        response: &client_first_message,
+        plus: false,
+    }))?;
 
-    let cont = match stream.recv_expect().await? {
+    println!("Sent Sasl reesponse");
+    let _ = chan.send(message).await;
+
+    // stream
+    //     .send(SaslInitialResponse {
+    //         response: &client_first_message,
+    //         plus: false,
+    //     })
+    //     .await?;
+
+    let cont = match chan.recv_expect().await? {
         Authentication::SaslContinue(data) => data,
 
         auth => {
@@ -84,6 +98,7 @@ pub(crate) async fn authenticate(
             ));
         }
     };
+    println!("got response");
 
     // SaltedPassword := Hi(Normalize(password), salt, i)
     let salted_password = hi(
@@ -143,18 +158,27 @@ pub(crate) async fn authenticate(
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
     BASE64_STANDARD.encode_string(client_proof, &mut client_final_message);
 
-    stream.send(SaslResponse(&client_final_message)).await?;
+    let mut message = IoRequestBuilder::new();
+    message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
+    message.wait_rfq();
 
-    let data = match stream.recv_expect().await? {
+    println!("Sent sasl reponse 2.");
+    let _ = chan.send(message).await;
+
+    // stream.send(SaslResponse(&client_final_message)).await?;
+
+    let data = match chan.recv_expect().await? {
         Authentication::SaslFinal(data) => data,
 
         auth => {
             return Err(err_protocol!("expected SASLFinal but received {:?}", auth));
         }
     };
+    println!("Got sasl final");
 
     // authentication is only considered valid if this verification passes
     mac.verify_slice(&data.verifier).map_err(Error::protocol)?;
+
 
     Ok(())
 }

@@ -1,7 +1,9 @@
 use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
+use futures_util::FutureExt;
 use std::ops::ControlFlow;
+use std::task::{ready, Context, Poll};
 use std::{cmp, io};
 
 use crate::io::{AsyncRead, AsyncReadExt, ProtocolDecode, ProtocolEncode};
@@ -120,6 +122,16 @@ impl<S: Socket> BufferedSocket<S> {
         self.write_buf.sanity_check();
 
         Ok(())
+    }
+
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.write_buf.is_empty() {
+            let written = ready!(self.socket.write(self.write_buf.get()).poll_unpin(cx))?;
+            self.write_buf.consume(written);
+            self.write_buf.sanity_check();
+        }
+
+        self.socket.poll_flush(cx)
     }
 
     pub async fn flush(&mut self) -> io::Result<()> {
