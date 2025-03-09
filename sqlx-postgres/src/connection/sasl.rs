@@ -1,4 +1,5 @@
 use crate::connection::stream::PgStream;
+use crate::connection::worker::WaitType;
 use crate::error::Error;
 use crate::message::{
     Authentication, AuthenticationSasl, EncodeMessage, SaslInitialResponse, SaslResponse,
@@ -11,7 +12,7 @@ use stringprep::saslprep;
 
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 
-use super::reactor::{IoRequest, IoRequestBuilder, ReactorSender};
+use super::worker::ConnManager;
 
 const GS2_HEADER: &str = "n,,";
 const CHANNEL_ATTR: &str = "c";
@@ -20,7 +21,7 @@ const CLIENT_PROOF_ATTR: &str = "p";
 const NONCE_ATTR: &str = "r";
 
 pub(crate) async fn authenticate(
-    chan: &mut ReactorSender,
+    manager: &mut ConnManager,
     stream: &mut PgStream,
     options: &PgConnectOptions,
     data: AuthenticationSasl,
@@ -72,14 +73,13 @@ pub(crate) async fn authenticate(
 
     let client_first_message = format!("{GS2_HEADER}{client_first_message_bare}");
 
-    let mut message = IoRequestBuilder::new();
-    message.write(EncodeMessage(SaslInitialResponse {
-        response: &client_first_message,
-        plus: false,
-    }))?;
-
-    println!("Sent Sasl reesponse");
-    let _ = chan.send(message).await;
+    manager.send_message(|message| {
+        message.write(EncodeMessage(SaslInitialResponse {
+            response: &client_first_message,
+            plus: false,
+        }))?;
+        Ok(WaitType::NumMessages { num_responses: 1 })
+    })?;
 
     // stream
     //     .send(SaslInitialResponse {
@@ -88,7 +88,7 @@ pub(crate) async fn authenticate(
     //     })
     //     .await?;
 
-    let cont = match chan.recv_expect().await? {
+    let cont = match manager.recv_expect().await? {
         Authentication::SaslContinue(data) => data,
 
         auth => {
@@ -158,16 +158,14 @@ pub(crate) async fn authenticate(
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
     BASE64_STANDARD.encode_string(client_proof, &mut client_final_message);
 
-    let mut message = IoRequestBuilder::new();
-    message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
-    message.wait_rfq();
-
-    println!("Sent sasl reponse 2.");
-    let _ = chan.send(message).await;
+    manager.send_message(|message| {
+        message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
+        Ok(WaitType::ReadyForQuery)
+    })?;
 
     // stream.send(SaslResponse(&client_final_message)).await?;
 
-    let data = match chan.recv_expect().await? {
+    let data = match manager.recv_expect().await? {
         Authentication::SaslFinal(data) => data,
 
         auth => {
@@ -178,7 +176,6 @@ pub(crate) async fn authenticate(
 
     // authentication is only considered valid if this verification passes
     mac.verify_slice(&data.verifier).map_err(Error::protocol)?;
-
 
     Ok(())
 }
