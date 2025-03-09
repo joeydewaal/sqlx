@@ -30,6 +30,7 @@ impl TransactionManager for PgTransactionManager {
             };
 
             let rollback = Rollback::new(conn);
+
             rollback.conn.queue_simple_query(&statement)?;
             rollback.conn.wait_until_ready().await?;
             if !rollback.conn.in_transaction() {
