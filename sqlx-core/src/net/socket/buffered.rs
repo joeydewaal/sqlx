@@ -19,8 +19,8 @@ pub struct BufferedSocket<S> {
 
 pub struct WriteBuffer {
     buf: Vec<u8>,
-    bytes_written: usize,
-    bytes_flushed: usize,
+    pub bytes_written: usize,
+    pub bytes_flushed: usize,
 }
 
 pub struct ReadBuffer {
@@ -44,41 +44,6 @@ impl<S: Socket> BufferedSocket<S> {
                 read: BytesMut::new(),
                 available: BytesMut::with_capacity(DEFAULT_BUF_SIZE),
             },
-        }
-    }
-
-    pub async fn read_buffered(&mut self, len: usize) -> Result<BytesMut, Error> {
-        self.try_read(|buf| {
-            Ok(if buf.len() < len {
-                ControlFlow::Continue(len)
-            } else {
-                ControlFlow::Break(buf.split_to(len))
-            })
-        })
-        .await
-    }
-
-    /// Retryable read operation.
-    ///
-    /// The callback should check the contents of the buffer passed to it and either:
-    ///
-    /// * Remove a full message from the buffer and return [`ControlFlow::Break`], or:
-    /// * Return [`ControlFlow::Continue`] with the expected _total_ length of the buffer,
-    ///   _without_ modifying it.
-    ///
-    /// Cancel-safe as long as the callback does not modify the passed `BytesMut`
-    /// before returning [`ControlFlow::Continue`].
-    pub async fn try_read<F, R>(&mut self, mut try_read: F) -> Result<R, Error>
-    where
-        F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
-    {
-        loop {
-            let read_len = match try_read(&mut self.read_buf.read)? {
-                ControlFlow::Continue(read_len) => read_len,
-                ControlFlow::Break(ret) => return Ok(ret),
-            };
-
-            self.read_buf.read(read_len, &mut self.socket).await?;
         }
     }
 
@@ -124,9 +89,77 @@ impl<S: Socket> BufferedSocket<S> {
         Ok(())
     }
 
+    pub fn poll_read_buffered(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+    ) -> Poll<Result<BytesMut, Error>> {
+        self.poll_try_read(cx, |buf| {
+            Ok(if buf.len() < len {
+                ControlFlow::Continue(len)
+            } else {
+                ControlFlow::Break(buf.split_to(len))
+            })
+        })
+    }
+    pub async fn read_buffered(&mut self, len: usize) -> Result<BytesMut, Error> {
+        self.try_read(|buf| {
+            Ok(if buf.len() < len {
+                ControlFlow::Continue(len)
+            } else {
+                ControlFlow::Break(buf.split_to(len))
+            })
+        })
+        .await
+    }
+
+    pub fn poll_try_read<F, R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut try_read: F,
+    ) -> Poll<crate::Result<R>>
+    where
+        F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
+    {
+        loop {
+            let read_len = match try_read(&mut self.read_buf.read)? {
+                ControlFlow::Continue(read_len) => read_len,
+                ControlFlow::Break(ret) => return Poll::Ready(Ok(ret)),
+            };
+
+            ready!(self.read_buf.poll_read(cx, read_len, &mut self.socket))?;
+        }
+    }
+
+    /// Retryable read operation.
+    ///
+    /// The callback should check the contents of the buffer passed to it and either:
+    ///
+    /// * Remove a full message from the buffer and return [`ControlFlow::Break`], or:
+    /// * Return [`ControlFlow::Continue`] with the expected _total_ length of the buffer,
+    ///   _without_ modifying it.
+    ///
+    /// Cancel-safe as long as the callback does not modify the passed `BytesMut`
+    /// before returning [`ControlFlow::Continue`].
+    pub async fn try_read<F, R>(&mut self, mut try_read: F) -> Result<R, Error>
+    where
+        F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
+    {
+        loop {
+            let read_len = match try_read(&mut self.read_buf.read)? {
+                ControlFlow::Continue(read_len) => read_len,
+                ControlFlow::Break(ret) => return Ok(ret),
+            };
+
+            self.read_buf.read(read_len, &mut self.socket).await?;
+        }
+    }
+
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.write_buf.is_empty() {
+            println!("Writing buff");
             let written = ready!(self.socket.write(self.write_buf.get()).poll_unpin(cx))?;
+            println!("Done writing");
             self.write_buf.consume(written);
             self.write_buf.sanity_check();
         }
@@ -171,7 +204,7 @@ impl<S: Socket> BufferedSocket<S> {
 }
 
 impl WriteBuffer {
-    fn sanity_check(&self) {
+    pub fn sanity_check(&self) {
         assert_ne!(self.buf.capacity(), 0);
         assert!(self.bytes_written <= self.buf.len());
         assert!(self.bytes_flushed <= self.bytes_written);
@@ -287,6 +320,36 @@ impl WriteBuffer {
 }
 
 impl ReadBuffer {
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+        socket: &mut impl Socket,
+    ) -> Poll<io::Result<()>> {
+        // Because of how `BytesMut` works, we should only be shifting capacity back and forth
+        // between `read` and `available` unless we have to read an oversize message.
+        while self.read.len() < len {
+            self.reserve(len - self.read.len());
+
+            let read = ready!(socket.poll_read(cx, &mut self.available))?;
+
+            if read == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "expected to read {} bytes, got {} bytes at EOF",
+                        len,
+                        self.read.len()
+                    ),
+                )));
+            }
+
+            self.advance(read);
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
     async fn read(&mut self, len: usize, socket: &mut impl Socket) -> io::Result<()> {
         // Because of how `BytesMut` works, we should only be shifting capacity back and forth
         // between `read` and `available` unless we have to read an oversize message.

@@ -1,5 +1,3 @@
-use futures_util::SinkExt as _;
-
 use crate::HashMap;
 
 use crate::common::StatementCache;
@@ -7,12 +5,11 @@ use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
 use crate::io::StatementId;
 use crate::message::{
-    Authentication, BackendKeyData, BackendMessageFormat, EncodeMessage, Password, ReadyForQuery,
-    Startup,
+    Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
 };
 use crate::{PgConnectOptions, PgConnection};
 
-use super::reactor::{IoRequestBuilder, Reactor};
+use super::worker::{WaitType, Worker};
 use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
@@ -25,7 +22,7 @@ impl PgConnection {
 
         let stream_bg = PgStream::connect(options).await?;
 
-        let mut chan = Reactor::spawn(stream_bg);
+        let chan = Worker::spawn(stream_bg);
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
@@ -53,23 +50,16 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        let mut message = IoRequestBuilder::new();
+        let mut manager = chan.manager();
 
-        message.write(Startup {
-            username: Some(&options.username),
-            database: options.database.as_deref(),
-            params: &params,
+        manager.send_message(|message| {
+            message.write(Startup {
+                username: Some(&options.username),
+                database: options.database.as_deref(),
+                params: &params,
+            })?;
+            Ok(WaitType::NumMessages { num_responses: 1 })
         })?;
-
-        let _ = chan.send(message).await;
-
-        stream.write(Startup {
-            username: Some(&options.username),
-            database: options.database.as_deref(),
-            params: &params,
-        })?;
-
-        stream.flush().await?;
 
         // The server then uses this information and the contents of
         // its configuration files (such as pg_hba.conf) to determine whether the connection is
@@ -81,7 +71,7 @@ impl PgConnection {
         let transaction_status;
 
         loop {
-            let message = chan.recv().await?;
+            let message = manager.recv().await?;
             match message.format {
                 BackendMessageFormat::Authentication => match message.decode()? {
                     Authentication::Ok => {
@@ -98,28 +88,27 @@ impl PgConnection {
                         //         options.password.as_deref().unwrap_or_default(),
                         //     ))
                         //     .await?;
-                        let mut message = IoRequestBuilder::new();
-
-                        message.write(EncodeMessage(Password::Cleartext(
-                            options.password.as_deref().unwrap_or_default(),
-                        )))?;
-
-                        let _ = chan.send(message).await;
+                        manager.send_message(|message| {
+                            message.write_msg(Password::Cleartext(
+                                options.password.as_deref().unwrap_or_default(),
+                            ))?;
+                            Ok(WaitType::NumMessages { num_responses: 1 })
+                        })?;
                     }
                     Authentication::Md5Password(body) => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
-                        let mut message = IoRequestBuilder::new();
-                        message.write(EncodeMessage(Password::Md5 {
-                            username: &options.username,
-                            password: options.password.as_deref().unwrap_or_default(),
-                            salt: body.salt,
-                        }))?;
+                        manager.send_message(|message| {
+                            message.write_msg(Password::Md5 {
+                                username: &options.username,
+                                password: options.password.as_deref().unwrap_or_default(),
+                                salt: body.salt,
+                            })?;
 
-                        let _ = chan.send(message).await;
-
+                            Ok(WaitType::NumMessages { num_responses: 1 })
+                        })?;
                         // stream
                         //     .send(Password::Md5 {
                         //         username: &options.username,
@@ -130,7 +119,7 @@ impl PgConnection {
                     }
 
                     Authentication::Sasl(body) => {
-                        sasl::authenticate(&mut chan, &mut stream, options, body).await?;
+                        sasl::authenticate(&mut manager, &mut stream, options, body).await?;
                     }
 
                     method => {
