@@ -28,14 +28,14 @@ impl IoRequest {
 }
 
 pub struct MessageBuf {
-    pub ends_at: WaitType,
+    num_messages: usize,
     data: Vec<u8>,
 }
 
 impl MessageBuf {
     pub fn new() -> Self {
         Self {
-            ends_at: WaitType::NumMessages { num_responses: 0 },
+            num_messages: 0,
             data: Vec::new(),
         }
     }
@@ -63,26 +63,17 @@ impl MessageBuf {
     }
 
     pub fn inc_response_count(&mut self) {
-        match &mut self.ends_at {
-            WaitType::NumMessages { num_responses } => {
-                *num_responses += 1;
-            }
-            _ => {}
-        }
+        self.num_messages += 1;
     }
     #[inline(always)]
     pub(crate) fn write_msg(&mut self, message: impl FrontendMessage) -> Result<(), Error> {
         self.write(EncodeMessage(message))
     }
 
-    pub fn wait_rfq(&mut self) {
-        self.ends_at = WaitType::ReadyForQuery
-    }
-
-    pub fn finish(self) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
+    pub fn finish(self, ends_at: WaitType) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
         let (tx, rx) = unbounded();
         let req = IoRequest {
-            ends_at: self.ends_at,
+            ends_at,
             data: self.data,
             chan: tx,
         };

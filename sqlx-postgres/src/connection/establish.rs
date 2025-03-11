@@ -1,14 +1,15 @@
-use crate::HashMap;
+use std::collections::BTreeMap;
 
 use crate::common::StatementCache;
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
-use crate::io::StatementId;
+use crate::io::{StatementId, StatementIdManager};
 use crate::message::{
     Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
 };
 use crate::{PgConnectOptions, PgConnection};
 
+use super::type_cache::TypeCache;
 use super::worker::{WaitType, Worker};
 use super::PgConnectionInner;
 
@@ -160,17 +161,17 @@ impl PgConnection {
         Ok(PgConnection {
             inner: Box::new(PgConnectionInner {
                 chan,
+                parameter_statuses: BTreeMap::new(),
+                server_version_num: None,
                 stream,
                 process_id,
                 secret_key,
                 transaction_status,
                 transaction_depth: 0,
                 pending_ready_for_query_count: 0,
-                next_statement_id: StatementId::NAMED_START,
+                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
                 cache_statement: StatementCache::new(options.statement_cache_capacity),
-                cache_type_oid: HashMap::new(),
-                cache_type_info: HashMap::new(),
-                cache_elem_type_to_array: HashMap::new(),
+                type_cache: TypeCache::new(),
                 log_settings: options.log_settings.clone(),
             }),
         })

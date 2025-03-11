@@ -17,11 +17,13 @@ use sqlx_core::{
 
 use crate::message::{BackendMessageFormat, ReceivedMessage};
 
-use super::{reactor::WorkerChan, PgStream};
+use super::PgStream;
 
+mod channel;
 mod manager;
 mod message;
 
+pub use channel::WorkerConn;
 pub use manager::ConnManager;
 pub use message::{IoRequest, MessageBuf, WaitType};
 
@@ -33,7 +35,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(stream: PgStream) -> WorkerChan {
+    pub fn spawn(stream: PgStream) -> WorkerConn {
         let (tx, rx) = unbounded();
 
         let conn = Worker {
@@ -44,7 +46,7 @@ impl Worker {
         };
 
         spawn(conn);
-        WorkerChan::new(tx)
+        WorkerConn::new(tx)
     }
 }
 

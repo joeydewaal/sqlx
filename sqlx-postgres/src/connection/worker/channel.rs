@@ -1,12 +1,12 @@
 use futures_channel::mpsc::UnboundedSender;
 
-use super::worker::{ConnManager, IoRequest};
+use super::{ConnManager, IoRequest};
 
-pub struct WorkerChan {
-    chan: UnboundedSender<IoRequest>,
+pub struct WorkerConn {
+    pub chan: UnboundedSender<IoRequest>,
 }
 
-impl WorkerChan {
+impl WorkerConn {
     pub fn new(chan: UnboundedSender<IoRequest>) -> Self {
         Self { chan }
     }
@@ -14,5 +14,9 @@ impl WorkerChan {
     pub fn manager(&self) -> ConnManager {
         // FIXME: give a ref back
         ConnManager::new(self.chan.clone())
+    }
+
+    pub fn close(&self) {
+        self.chan.close_channel();
     }
 }

@@ -1,21 +1,19 @@
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
-use crate::HashMap;
 use futures_core::future::BoxFuture;
-use reactor::WorkerChan;
-use worker::WaitType;
+use type_cache::TypeCache;
+use worker::{ConnManager, IoRequest, WaitType, WorkerConn};
 
 use crate::common::StatementCache;
 use crate::error::Error;
-use crate::ext::ustr::UStr;
-use crate::io::StatementId;
-use crate::message::{Close, ReadyForQuery, ReceivedMessage, TransactionStatus};
+use crate::io::{StatementId, StatementIdManager};
+use crate::message::{Close, Query, TransactionStatus};
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
-use crate::types::Oid;
-use crate::{PgConnectOptions, PgTypeInfo, Postgres};
+use crate::{PgConnectOptions, Postgres};
 
 pub(crate) use sqlx_core::connection::*;
 
@@ -24,11 +22,11 @@ pub use self::stream::PgStream;
 pub(crate) mod describe;
 mod establish;
 mod executor;
-mod reactor;
 mod sasl;
 mod stream;
 mod tls;
-mod worker;
+mod type_cache;
+pub(crate) mod worker;
 
 /// A connection to a PostgreSQL database.
 ///
@@ -39,12 +37,16 @@ pub struct PgConnection {
 
 pub struct PgConnectionInner {
     // Channel to the background worker
-    pub(crate) chan: WorkerChan,
+    pub(crate) chan: WorkerConn,
 
     // underlying TCP or UDS stream,
     // wrapped in a potentially TLS stream,
     // wrapped in a buffered stream
     pub(crate) stream: PgStream,
+
+    pub(crate) parameter_statuses: BTreeMap<String, String>,
+
+    pub(crate) server_version_num: Option<u32>,
 
     // process id of this backend
     // used to send cancel requests
@@ -58,15 +60,12 @@ pub struct PgConnectionInner {
 
     // sequence of statement IDs for use in preparing statements
     // in PostgreSQL, the statement is prepared to a user-supplied identifier
-    next_statement_id: StatementId,
+    stmt_id_manager: StatementIdManager,
 
     // cache statement by query string to the id and columns
     cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
 
-    // cache user-defined types by id <-> info
-    cache_type_info: HashMap<Oid, PgTypeInfo>,
-    cache_type_oid: HashMap<UStr, Oid>,
-    cache_elem_type_to_array: HashMap<Oid, Oid>,
+    type_cache: TypeCache,
 
     // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,
@@ -85,28 +84,41 @@ impl PgConnection {
         // self.inner.stream.server_version_num
     }
 
-    #[inline(always)]
-    fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
-        self.inner.pending_ready_for_query_count = self
-            .inner
-            .pending_ready_for_query_count
-            .checked_sub(1)
-            .ok_or_else(|| err_protocol!("received more ReadyForQuery messages than expected"))?;
+    // #[inline(always)]
+    // fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
+    // self.inner.pending_ready_for_query_count = self
+    //     .inner
+    //     .pending_ready_for_query_count
+    //     .checked_sub(1)
+    //     .ok_or_else(|| err_protocol!("received more ReadyForQuery messages than expected"))?;
 
-        self.inner.transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
+    // self.inner.transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
 
-        Ok(())
-    }
+    // Ok(())
+    // }
 
     /// Queue a simple query (not prepared) to execute the next time this connection is used.
     ///
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
-    pub(crate) fn queue_simple_query(&mut self, query: &str) -> Result<(), Error> {
+    pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager, Error> {
+        let mut manager = self.inner.chan.manager();
+        manager.send_message(|buff| {
+            buff.write_msg(Query(query))?;
+            Ok(WaitType::ReadyForQuery)
+        })?;
         // self.inner.stream.write_msg(Query(query))?;
         // self.inner.pending_ready_for_query_count += 1;
 
-        Ok(())
+        Ok(manager)
+    }
+
+    pub(crate) fn unbounded_send(&self, req: IoRequest) -> sqlx_core::Result<()> {
+        self.inner
+            .chan
+            .chan
+            .unbounded_send(req)
+            .map_err(|_| sqlx_core::Error::WorkerCrashed)
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
@@ -128,13 +140,13 @@ impl Connection for PgConnection {
 
     type Options = PgConnectOptions;
 
-    fn close(mut self) -> BoxFuture<'static, Result<(), Error>> {
+    fn close(self) -> BoxFuture<'static, Result<(), Error>> {
         // The normal, graceful termination procedure is that the frontend sends a Terminate
         // message and immediately closes the connection.
 
         // On receipt of this message, the backend closes the
         // connection and terminates.
-
+        self.inner.chan.close();
         Box::pin(async move {
             // self.inner.stream.send(Terminate).await?;
             // self.inner.stream.shutdown().await?;
@@ -143,7 +155,8 @@ impl Connection for PgConnection {
         })
     }
 
-    fn close_hard(mut self) -> BoxFuture<'static, Result<(), Error>> {
+    fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
+        self.inner.chan.close();
         Box::pin(async move {
             // self.inner.stream.shutdown().await?;
 
@@ -157,10 +170,10 @@ impl Connection for PgConnection {
         // self.execute("/* SQLx ping */").map_ok(|_| ()).boxed()
 
         Box::pin(async move {
-            // The simplest call-and-response that's possible.
             let mut manager = self.inner.chan.manager();
 
             manager.send_message(|message| {
+                // The simplest call-and-response that's possible.
                 message.write_sync();
                 Ok(WaitType::ReadyForQuery)
             })?;
@@ -192,7 +205,7 @@ impl Connection for PgConnection {
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.cache_type_oid.clear();
+            self.inner.type_cache.clear_oid_cache();
 
             let mut cleared = 0_usize;
 
@@ -232,7 +245,7 @@ impl Connection for PgConnection {
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
         // !self.inner.stream.write_buffer().is_empty()
-        todo!();
+        false
     }
 }
 
