@@ -2,20 +2,21 @@ use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 use futures_core::future::BoxFuture;
-use futures_core::stream::BoxStream;
 
+use futures_core::stream::BoxStream;
+use futures_core::Stream;
 use sqlx_core::bytes::{BufMut, Bytes};
 
+use crate::connection::worker::ConnManager;
 use crate::connection::PgConnection;
 use crate::error::{Error, Result};
-use crate::ext::async_stream::TryAsyncStream;
 use crate::io::AsyncRead;
 use crate::message::{
     BackendMessageFormat, CommandComplete, CopyData, CopyDone, CopyFail, CopyInResponse,
     CopyOutResponse, CopyResponseData, Query, ReadyForQuery,
 };
 use crate::pool::{Pool, PoolConnection};
-use crate::Postgres;
+use crate::{Postgres, WaitType};
 
 impl PgConnection {
     /// Issue a `COPY FROM STDIN` statement and transition the connection to streaming data
@@ -59,7 +60,8 @@ impl PgConnection {
         &'c mut self,
         statement: &str,
     ) -> Result<BoxStream<'c, Result<Bytes>>> {
-        pg_begin_copy_out(self, statement).await
+        let stream = pg_begin_copy_out(self, statement).await?;
+        Ok(stream)
     }
 }
 
@@ -110,7 +112,7 @@ pub trait PgPoolCopyExt {
     fn copy_out_raw<'a>(
         &'a self,
         statement: &'a str,
-    ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>>;
+    ) -> BoxFuture<'a, Result<impl Stream<Item = Result<Bytes>> + Send + 'static>>;
 }
 
 impl PgPoolCopyExt for Pool<Postgres> {
@@ -124,7 +126,7 @@ impl PgPoolCopyExt for Pool<Postgres> {
     fn copy_out_raw<'a>(
         &'a self,
         statement: &'a str,
-    ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>> {
+    ) -> BoxFuture<'a, Result<impl Stream<Item = Result<Bytes>> + Send + 'static>> {
         Box::pin(async { pg_begin_copy_out(self.acquire().await?, statement).await })
     }
 }
@@ -142,23 +144,32 @@ pub const PG_COPY_MAX_DATA_LEN: usize = 0x3fffffff - 1 - 4;
 #[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
 pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
     conn: Option<C>,
+    manager: ConnManager,
     response: CopyResponseData,
 }
 
 impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
-    async fn begin(mut conn: C, statement: &str) -> Result<Self> {
-        conn.inner.stream.send(Query(statement)).await?;
+    async fn begin(conn: C, statement: &str) -> Result<Self> {
+        let mut manager = conn.inner.chan.manager();
 
-        let response = match conn.inner.stream.recv_expect::<CopyInResponse>().await {
+        manager.send_message(|buff| {
+            buff.write_msg(Query(statement))?;
+            // FIXME
+            Ok(WaitType::ReadyForQuery)
+        })?;
+
+        let response = match manager.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
-                conn.inner.stream.recv().await?;
+                // FIXME: Joey: Should be ReadyForQuery???
+                // conn.inner.stream.recv().await?;
                 return Err(e);
             }
         };
 
         Ok(PgCopyIn {
             conn: Some(conn),
+            manager,
             response,
         })
     }
@@ -194,13 +205,10 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
-            self.conn
-                .as_deref_mut()
-                .expect("send_data: conn taken")
-                .inner
-                .stream
-                .send(CopyData(chunk))
-                .await?;
+            self.manager.send_message(|buff| {
+                buff.write_msg(CopyData(chunk))?;
+                Ok(WaitType::NumMessages { num_responses: 0 })
+            })?;
         }
 
         Ok(self)
@@ -220,33 +228,34 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// The runtime features _used_ to be mutually exclusive, but are no longer.
     /// If both `runtime-async-std` and `runtime-tokio` features are enabled, the Tokio version
     /// takes precedent.
-    pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
-        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
-        loop {
-            let buf = conn.inner.stream.write_buffer_mut();
+    // TODO: Joey
+    // pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
+    //     let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
+    //     loop {
+    //         let buf = conn.inner.stream.write_buffer_mut();
 
-            // Write the CopyData format code and reserve space for the length.
-            // This may end up sending an empty `CopyData` packet if, after this point,
-            // we get canceled or read 0 bytes, but that should be fine.
-            buf.put_slice(b"d\0\0\0\x04");
+    //         // Write the CopyData format code and reserve space for the length.
+    //         // This may end up sending an empty `CopyData` packet if, after this point,
+    //         // we get canceled or read 0 bytes, but that should be fine.
+    //         buf.put_slice(b"d\0\0\0\x04");
 
-            let read = buf.read_from(&mut source).await?;
+    //         let read = buf.read_from(&mut source).await?;
 
-            if read == 0 {
-                break;
-            }
+    //         if read == 0 {
+    //             break;
+    //         }
 
-            // Write the length
-            let read32 = i32::try_from(read)
-                .map_err(|_| err_protocol!("number of bytes read exceeds 2^31 - 1: {}", read))?;
+    //         // Write the length
+    //         let read32 = i32::try_from(read)
+    //             .map_err(|_| err_protocol!("number of bytes read exceeds 2^31 - 1: {}", read))?;
 
-            (&mut buf.get_mut()[1..]).put_i32(read32 + 4);
+    //         (&mut buf.get_mut()[1..]).put_i32(read32 + 4);
 
-            conn.inner.stream.flush().await?;
-        }
+    //         conn.inner.stream.flush().await?;
+    //     }
 
-        Ok(self)
-    }
+    //     Ok(self)
+    // }
 
     /// Signal that the `COPY` process should be aborted and any data received should be discarded.
     ///
@@ -254,14 +263,13 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The server is expected to respond with an error, so only _unexpected_ errors are returned.
     pub async fn abort(mut self, msg: impl Into<String>) -> Result<()> {
-        let mut conn = self
-            .conn
-            .take()
-            .expect("PgCopyIn::fail_with: conn taken illegally");
+        self.manager.send_message(|buff| {
+            buff.write_msg(CopyFail::new(msg))?;
+            // TODO: Joey
+            Ok(WaitType::ReadyForQuery)
+        })?;
 
-        conn.inner.stream.send(CopyFail::new(msg)).await?;
-
-        match conn.inner.stream.recv().await {
+        match self.manager.recv().await {
             Ok(msg) => Err(err_protocol!(
                 "fail_with: expected ErrorResponse, got: {:?}",
                 msg.format
@@ -270,7 +278,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 match e.code() {
                     Some(Cow::Borrowed("57014")) => {
                         // postgres abort received error code
-                        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+                        self.manager.recv_expect::<ReadyForQuery>().await?;
                         Ok(())
                     }
                     _ => Err(Error::Database(e)),
@@ -284,21 +292,21 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(mut self) -> Result<u64> {
-        let mut conn = self
-            .conn
-            .take()
-            .expect("CopyWriter::finish: conn taken illegally");
+        self.manager.send_message(|buff| {
+            buff.write_msg(CopyDone)?;
+            Ok(WaitType::ReadyForQuery)
+        })?;
 
-        conn.inner.stream.send(CopyDone).await?;
-        let cc: CommandComplete = match conn.inner.stream.recv_expect().await {
+        let cc: CommandComplete = match self.manager.recv_expect().await {
             Ok(cc) => cc,
             Err(e) => {
-                conn.inner.stream.recv().await?;
+                // FIXME: Joey: huh???
+                self.manager.recv().await?;
                 return Err(e);
             }
         };
 
-        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
+        self.manager.recv_expect::<ReadyForQuery>().await?;
 
         Ok(cc.rows_affected())
     }
@@ -318,33 +326,71 @@ impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
 }
 
 async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
-    mut conn: C,
+    conn: C,
     statement: &str,
 ) -> Result<BoxStream<'c, Result<Bytes>>> {
-    conn.inner.stream.send(Query(statement)).await?;
+    let mut manager = conn.inner.chan.manager();
 
-    let _: CopyOutResponse = conn.inner.stream.recv_expect().await?;
+    manager.send_message(|buff| {
+        buff.write_msg(Query(statement))?;
+        Ok(WaitType::ReadyForQuery)
+    })?;
 
-    let stream: TryAsyncStream<'c, Bytes> = try_stream! {
-        loop {
-            match conn.inner.stream.recv().await {
-                Err(e) => {
-                    conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
-                    return Err(e);
-                },
-                Ok(msg) => match msg.format {
-                    BackendMessageFormat::CopyData => r#yield!(msg.decode::<CopyData<Bytes>>()?.0),
-                    BackendMessageFormat::CopyDone => {
-                        let _ = msg.decode::<CopyDone>()?;
-                        conn.inner.stream.recv_expect::<CommandComplete>().await?;
-                        conn.inner.stream.recv_expect::<ReadyForQuery>().await?;
-                        return Ok(())
-                    },
-                    _ => return Err(err_protocol!("unexpected message format during copy out: {:?}", msg.format))
-                }
+    let _: CopyOutResponse = manager.recv_expect().await?;
+
+    let stream = PgCopyStream::new(conn, manager);
+
+    Ok(stream.into_stream())
+}
+
+struct PgCopyStream<C> {
+    #[allow(unused)]
+    conn: C,
+    manager: ConnManager,
+}
+
+impl<'c, C> PgCopyStream<C>
+where
+    C: Send + 'c,
+{
+    fn new(conn: C, manager: ConnManager) -> Self {
+        Self { conn, manager }
+    }
+
+    async fn next(&mut self) -> Result<Option<Bytes>> {
+        match self.manager.recv().await {
+            Err(e) => {
+                self.manager.recv_expect::<ReadyForQuery>().await?;
+                return Err(e);
             }
+            Ok(msg) => match msg.format {
+                BackendMessageFormat::CopyData => {
+                    return Ok(Some(msg.decode::<CopyData<Bytes>>()?.0));
+                }
+                BackendMessageFormat::CopyDone => {
+                    let _ = msg.decode::<CopyDone>()?;
+                    self.manager.recv_expect::<CommandComplete>().await?;
+                    self.manager.recv_expect::<ReadyForQuery>().await?;
+                    return Ok(None);
+                }
+                _ => {
+                    return Err(err_protocol!(
+                        "unexpected message format during copy out: {:?}",
+                        msg.format
+                    ))
+                }
+            },
         }
-    };
+    }
 
-    Ok(Box::pin(stream))
+    fn into_stream(self) -> BoxStream<'c, Result<Bytes>> {
+        Box::pin(futures_util::stream::try_unfold(self, |mut this| async move {
+            let item = this.next().await?;
+            if let Some(data) = item {
+                return Ok(Some((data, this)));
+            } else {
+                return Ok(None);
+            }
+        }))
+    }
 }

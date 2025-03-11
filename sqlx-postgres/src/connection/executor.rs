@@ -24,13 +24,12 @@ use std::{borrow::Cow, pin::pin, sync::Arc};
 use super::worker::ConnManager;
 
 async fn prepare(
-    conn: &mut PgConnection,
+    conn: &PgConnection,
     sql: &str,
     parameters: &[PgTypeInfo],
     metadata: Option<Arc<PgStatementMetadata>>,
 ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-    let id = conn.inner.next_statement_id;
-    conn.inner.next_statement_id = id.next();
+    let id = conn.inner.stmt_id_manager.fetch_and_update();
 
     // build a list of type OIDs to send to the database in the PARSE command
     // we have not yet started the query sequence, so we are *safe* to cleanly make
