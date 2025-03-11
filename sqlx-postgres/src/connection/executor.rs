@@ -118,6 +118,102 @@ async fn recv_desc_rows(conn: &mut ConnManager) -> Result<Option<RowDescription>
     Ok(rows)
 }
 
+pub struct RowStreamer<'c, 'q> {
+    conn: &'c PgConnection,
+    manager: ConnManager,
+    logger: QueryLogger<'q>,
+    metadata: Arc<PgStatementMetadata>,
+    format: PgValueFormat,
+}
+
+impl RowStreamer<'_, '_> {
+    async fn next(&mut self) -> sqlx_core::Result<Option<Either<PgQueryResult, PgRow>>> {
+        loop {
+            println!("FG: manager.recv");
+            let message = self.manager.recv().await?;
+            println!("FG: manager.recv done {:?}", message.format);
+
+            match message.format {
+                    BackendMessageFormat::BindComplete
+                    | BackendMessageFormat::ParseComplete
+                    | BackendMessageFormat::ParameterDescription
+                    | BackendMessageFormat::NoData
+                    // unnamed portal has been closed
+                    | BackendMessageFormat::CloseComplete
+                    => {
+                        // harmless messages to ignore
+                    }
+
+                    // "Execute phase is always terminated by the appearance of
+                    // exactly one of these messages: CommandComplete,
+                    // EmptyQueryResponse (if the portal was created from an
+                    // empty query string), ErrorResponse, or PortalSuspended"
+                    BackendMessageFormat::CommandComplete => {
+                        // a SQL command completed normally
+                        let cc: CommandComplete = message.decode()?;
+
+                        let rows_affected = cc.rows_affected();
+                        self.logger.increase_rows_affected(rows_affected);
+                        return Ok(Some(
+Either::Left(PgQueryResult {
+                            rows_affected,
+                        })));
+                    }
+
+                    BackendMessageFormat::EmptyQueryResponse => {
+                        // empty query string passed to an unprepared execute
+                    }
+
+                    // Message::ErrorResponse is handled in self.stream.recv()
+
+                    // incomplete query execution has finished
+                    BackendMessageFormat::PortalSuspended => {}
+
+                    BackendMessageFormat::RowDescription => {
+                        // indicates that a *new* set of rows are about to be returned
+                        let (columns, column_names) = self.conn
+                            .handle_row_description(Some(message.decode()?), false)
+                            .await?;
+
+                        self.metadata = Arc::new(PgStatementMetadata {
+                            column_names: Arc::new(column_names),
+                            columns,
+                            parameters: Vec::default(),
+                        });
+                    }
+
+                    BackendMessageFormat::DataRow => {
+                        self.logger.increment_rows_returned();
+
+                        // one of the set of rows returned by a SELECT, FETCH, etc query
+                        let data: DataRow = message.decode()?;
+                        let row = PgRow {
+                            data,
+                            format: self.format,
+                            metadata: Arc::clone(&self.metadata),
+                        };
+
+                        return Ok(Some(Either::Right(row)))
+                    }
+
+                    BackendMessageFormat::ReadyForQuery => {
+
+                        println!("FG: query done");
+                        // processing of the query string is complete
+                        return Ok(None);
+                    }
+
+                    _ => {
+                        return Err(err_protocol!(
+                            "execute: unexpected message: {:?}",
+                            message.format
+                        ));
+                    }
+                }
+        }
+    }
+}
+
 impl PgConnection {
     async fn get_or_prepare<'a>(
         &self,
@@ -166,6 +262,8 @@ impl PgConnection {
         let mut metadata: Arc<PgStatementMetadata>;
         let mut manager = self.inner.chan.manager();
 
+        let arg_buff = arguments.clone();
+
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
             //
@@ -186,8 +284,6 @@ impl PgConnection {
                 .get_or_prepare(query, &arguments.types, persistent, metadata_opt)
                 .await?;
 
-            dbg!(&statement, &metadata_);
-
             metadata = metadata_;
 
             // patch holes created during encoding
@@ -198,6 +294,7 @@ impl PgConnection {
 
             manager.send_message(|messages| {
                 // bind to attach the arguments to the statement and create a portal
+                println!("BIND");
                 messages.write_msg(Bind {
                     portal: PortalId::UNNAMED,
                     statement,
@@ -216,6 +313,7 @@ impl PgConnection {
                 // soon as the next Bind statement specifying the unnamed portal as
                 // destination is issued. (Note that a simple Query message also
                 // destroys the unnamed portal."
+                println!("EXECUTE");
                 messages.write_msg(message::Execute {
                     portal: PortalId::UNNAMED,
                     limit: 0,
@@ -223,6 +321,7 @@ impl PgConnection {
 
                 // we ask the database server to close the unnamed portal and free the associated resources
                 // earlier - after the execution of the current query.
+                println!("CLOSE");
                 messages.write_msg(Close::Portal(PortalId::UNNAMED))?;
 
                 // finally, [Sync] asks postgres to process the messages that we sent and respond with
@@ -230,6 +329,7 @@ impl PgConnection {
                 // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
                 // is still serial but it would reduce round-trips. Some kind of builder pattern that is
                 // termed batching might suit this.
+                println!("SYNC");
                 messages.write_msg(Sync {})?;
                 Ok(PipeUntil::ReadyForQuery)
             })?;
@@ -252,7 +352,9 @@ impl PgConnection {
 
         Ok(try_stream! {
             loop {
+                println!("FG: manager.recv");
                 let message = manager.recv().await?;
+                println!("FG: manager.recv done {:?}", message.format);
 
                 match message.format {
                     BackendMessageFormat::BindComplete
@@ -317,6 +419,8 @@ impl PgConnection {
                     }
 
                     BackendMessageFormat::ReadyForQuery => {
+
+                        println!("FG: query done {:?}", arg_buff.unwrap().buffer);
                         // processing of the query string is complete
                         break;
                     }
@@ -382,6 +486,7 @@ impl<'c> Executor<'c> for &'c PgConnection {
         let persistent = query.persistent();
 
         Box::pin(async move {
+            println!("start fetching optional");
             let arguments = arguments?;
             let mut s = pin!(self.run(sql, arguments, persistent, metadata).await?);
 

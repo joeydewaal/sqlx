@@ -141,6 +141,7 @@ impl Connection for PgConnection {
     type Options = PgConnectOptions;
 
     fn close(self) -> BoxFuture<'static, Result<(), Error>> {
+        println!("Closing");
         // The normal, graceful termination procedure is that the frontend sends a Terminate
         // message and immediately closes the connection.
 

@@ -79,15 +79,12 @@ impl ConnManager {
     // May wait for more data from the server
     pub(crate) async fn recv(&mut self) -> Result<ReceivedMessage, Error> {
         loop {
-            println!("ReactorReceiver::recv");
             let x = self
                 .last_receiver
                 .as_mut()
                 .ok_or(sqlx_core::Error::WorkerCrashed)?;
 
             let message = x.next().await.ok_or(Error::WorkerCrashed)?;
-            println!("fg worker got: {message:?}");
-
             match message.format {
                 BackendMessageFormat::ErrorResponse => {
                     // An error returned from the database server.
