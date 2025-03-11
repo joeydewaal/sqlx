@@ -37,6 +37,8 @@ impl TransactionManager for PgTransactionManager {
                 return Err(Error::BeginFailed);
             }
             rollback.conn.inner.transaction_depth += 1;
+            // rollback.conn.wait_until_ready().await?;
+            manager.recv_ready_for_query().await?;
             rollback.defuse();
 
             Ok(())
