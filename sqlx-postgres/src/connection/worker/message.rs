@@ -14,6 +14,7 @@ pub struct IoRequest {
     pub chan: UnboundedSender<ReceivedMessage>,
     pub data: Vec<u8>,
     pub ends_at: PipeUntil,
+    pub id: usize,
 }
 
 impl IoRequest {
@@ -73,6 +74,7 @@ impl MessageBuf {
     pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
         let (tx, rx) = unbounded();
         let req = IoRequest {
+            id: 0,
             ends_at,
             data: self.data,
             chan: tx,

@@ -58,11 +58,13 @@ impl<T> Yielder<T> {
 
     /// NOTE: may deadlock the task if called from outside the future passed to `TryAsyncStream`.
     pub async fn r#yield(&self, val: T) {
+        println!("Locking");
         let replaced = self
             .value
             .lock()
             .expect("BUG: panicked while holding a lock")
             .replace(val);
+        println!("Locking done");
 
         debug_assert!(
             replaced.is_none(),
@@ -88,10 +90,13 @@ impl<T> Yielder<T> {
     }
 
     fn take(&self) -> Option<T> {
-        self.value
+        println!("Locking");
+        let x=  self.value
             .lock()
             .expect("BUG: panicked while holding a lock")
-            .take()
+            .take();
+        println!("Locking done");
+        x
     }
 }
 

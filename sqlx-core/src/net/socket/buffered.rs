@@ -121,12 +121,15 @@ impl<S: Socket> BufferedSocket<S> {
     where
         F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
     {
+        // println!("poll_try_read");
         loop {
+            // println!("try_read");
             let read_len = match try_read(&mut self.read_buf.read)? {
                 ControlFlow::Continue(read_len) => read_len,
                 ControlFlow::Break(ret) => return Poll::Ready(Ok(ret)),
             };
 
+            // println!("need: {read_len}");
             ready!(self.read_buf.poll_read(cx, read_len, &mut self.socket))?;
         }
     }
@@ -157,9 +160,9 @@ impl<S: Socket> BufferedSocket<S> {
 
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.write_buf.is_empty() {
-            println!("Writing buff");
+            // println!("Writing buff");
             let written = ready!(self.socket.write(self.write_buf.get()).poll_unpin(cx))?;
-            println!("Done writing");
+            // println!("Done writing");
             self.write_buf.consume(written);
             self.write_buf.sanity_check();
         }
