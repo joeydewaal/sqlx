@@ -25,7 +25,7 @@ mod message;
 
 pub use channel::WorkerConn;
 pub use manager::ConnManager;
-pub use message::{IoRequest, MessageBuf, WaitType};
+pub use message::{IoRequest, MessageBuf, PipeUntil};
 
 pub struct Worker {
     should_flush: bool,
@@ -64,7 +64,7 @@ impl Future for Worker {
             write_buff.bytes_written = msg.data.len();
             write_buff.sanity_check();
 
-            if !matches!(msg.ends_at, WaitType::NumMessages { num_responses: 0 }) {
+            if !matches!(msg.ends_at, PipeUntil::NumMessages { num_responses: 0 }) {
                 self.back_log.push_back(msg);
             }
         }
@@ -94,13 +94,13 @@ impl Future for Worker {
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
                 let _ = msg.chan.unbounded_send(response);
                 match msg.ends_at {
-                    WaitType::ReadyForQuery => {
+                    PipeUntil::ReadyForQuery => {
                         println!("Waited for rfq");
                         if is_rfq {
                             break;
                         }
                     }
-                    WaitType::NumMessages { num_responses } => {
+                    PipeUntil::NumMessages { num_responses } => {
                         println!("{num_responses}");
                         if num_responses == 0 {
                             break;
