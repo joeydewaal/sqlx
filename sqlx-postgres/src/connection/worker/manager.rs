@@ -10,7 +10,7 @@ use crate::{
     PgDatabaseError,
 };
 
-use super::{message::WaitType, IoRequest, MessageBuf};
+use super::{message::PipeUntil, IoRequest, MessageBuf};
 
 pub struct ConnManager {
     chan: UnboundedSender<IoRequest>,
@@ -27,7 +27,7 @@ impl ConnManager {
 
     pub fn send_message<F>(&mut self, callback: F) -> sqlx_core::Result<()>
     where
-        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<WaitType>,
+        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
     {
         let mut buffer = MessageBuf::new();
         let wait_type = (callback)(&mut buffer)?;
@@ -110,9 +110,12 @@ impl ConnManager {
                     let ParameterStatus { name, value } = message.decode()?;
                     // TODO: handle `client_encoding`, `DateStyle` change
 
+                    dbg!(&name, &value);
                     match name.as_str() {
                         "server_version" => {
-                            // self.server_version_num = parse_server_version(&value);
+                            if let Some(_version) = parse_server_version(&value) {
+                                // self.into
+                            }
                         }
                         _ => {
                             // self.parameter_statuses.insert(name, value);

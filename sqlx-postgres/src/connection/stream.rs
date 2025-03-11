@@ -1,5 +1,4 @@
 use std::ops::{ControlFlow, Deref, DerefMut};
-use std::str::FromStr;
 
 use futures_channel::mpsc::UnboundedSender;
 use sqlx_core::bytes::Buf;

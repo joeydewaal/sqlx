@@ -44,7 +44,7 @@ mod migrate;
 mod testing;
 
 pub(crate) use sqlx_core::driver_prelude::*;
-pub(crate) use connection::worker::WaitType;
+pub(crate) use connection::worker::PipeUntil;
 
 pub use advisory_lock::{PgAdvisoryLock, PgAdvisoryLockGuard, PgAdvisoryLockKey};
 pub use arguments::{PgArgumentBuffer, PgArguments};

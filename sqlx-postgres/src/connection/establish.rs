@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::AtomicUsize;
 
-use crate::common::StatementCache;
+use crate::connection::stmt_cache::SharedStatementCache;
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
@@ -10,7 +11,7 @@ use crate::message::{
 use crate::{PgConnectOptions, PgConnection};
 
 use super::type_cache::TypeCache;
-use super::worker::{WaitType, Worker};
+use super::worker::{PipeUntil, Worker};
 use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
@@ -19,7 +20,7 @@ use super::PgConnectionInner;
 impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
-        let mut stream = PgStream::connect(options).await?;
+        let stream = PgStream::connect(options).await?;
 
         let stream_bg = PgStream::connect(options).await?;
 
@@ -59,7 +60,7 @@ impl PgConnection {
                 database: options.database.as_deref(),
                 params: &params,
             })?;
-            Ok(WaitType::NumMessages { num_responses: 1 })
+            Ok(PipeUntil::NumMessages { num_responses: 1 })
         })?;
 
         // The server then uses this information and the contents of
@@ -84,16 +85,11 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        // stream
-                        //     .send(Password::Cleartext(
-                        //         options.password.as_deref().unwrap_or_default(),
-                        //     ))
-                        //     .await?;
                         manager.send_message(|message| {
                             message.write_msg(Password::Cleartext(
                                 options.password.as_deref().unwrap_or_default(),
                             ))?;
-                            Ok(WaitType::NumMessages { num_responses: 1 })
+                            Ok(PipeUntil::NumMessages { num_responses: 1 })
                         })?;
                     }
                     Authentication::Md5Password(body) => {
@@ -108,19 +104,12 @@ impl PgConnection {
                                 salt: body.salt,
                             })?;
 
-                            Ok(WaitType::NumMessages { num_responses: 1 })
+                            Ok(PipeUntil::NumMessages { num_responses: 1 })
                         })?;
-                        // stream
-                        //     .send(Password::Md5 {
-                        //         username: &options.username,
-                        //         password: options.password.as_deref().unwrap_or_default(),
-                        //         salt: body.salt,
-                        //     })
-                        //     .await?;
                     }
 
                     Authentication::Sasl(body) => {
-                        sasl::authenticate(&mut manager, &mut stream, options, body).await?;
+                        sasl::authenticate(&mut manager, options, body).await?;
                     }
 
                     method => {
@@ -157,20 +146,20 @@ impl PgConnection {
                 }
             }
         }
+        println!("Done establish");
 
         Ok(PgConnection {
             inner: Box::new(PgConnectionInner {
                 chan,
-                parameter_statuses: BTreeMap::new(),
+                parameter_statuses: BTreeMap::new().into(),
                 server_version_num: None,
                 stream,
                 process_id,
                 secret_key,
                 transaction_status,
-                transaction_depth: 0,
-                pending_ready_for_query_count: 0,
+                transaction_depth: AtomicUsize::new(0),
                 stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
-                cache_statement: StatementCache::new(options.statement_cache_capacity),
+                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
                 type_cache: TypeCache::new(),
                 log_settings: options.log_settings.clone(),
             }),

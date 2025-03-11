@@ -98,7 +98,7 @@ impl TryFrom<i8> for TypCategory {
 
 impl PgConnection {
     pub(super) async fn handle_row_description(
-        &mut self,
+        &self,
         desc: Option<RowDescription>,
         should_fetch: bool,
     ) -> Result<(Vec<PgColumn>, HashMap<UStr, usize>), Error> {
@@ -138,7 +138,7 @@ impl PgConnection {
     }
 
     pub(super) async fn handle_parameter_description(
-        &mut self,
+        &self,
         desc: ParameterDescription,
     ) -> Result<Vec<PgTypeInfo>, Error> {
         let mut params = Vec::with_capacity(desc.types.len());
@@ -151,7 +151,7 @@ impl PgConnection {
     }
 
     async fn maybe_fetch_type_info_by_oid(
-        &mut self,
+        &self,
         oid: Oid,
         should_fetch: bool,
     ) -> Result<PgTypeInfo, Error> {
@@ -187,7 +187,7 @@ impl PgConnection {
         }
     }
 
-    async fn fetch_type_by_oid(&mut self, oid: Oid) -> Result<PgTypeInfo, Error> {
+    async fn fetch_type_by_oid(&self, oid: Oid) -> Result<PgTypeInfo, Error> {
         let (name, typ_type, category, relation_id, element, base_type): (
             String,
             i8,
@@ -208,7 +208,7 @@ impl PgConnection {
                      WHERE oid = $1",
         )
         .bind(oid)
-        .fetch_one(&mut *self)
+        .fetch_one(&*self)
         .await?;
 
         let typ_type = TypType::try_from(typ_type);
@@ -253,7 +253,7 @@ impl PgConnection {
         }
     }
 
-    async fn fetch_enum_by_oid(&mut self, oid: Oid, name: String) -> Result<PgTypeInfo, Error> {
+    async fn fetch_enum_by_oid(&self, oid: Oid, name: String) -> Result<PgTypeInfo, Error> {
         let variants: Vec<String> = query_scalar(
             r#"
 SELECT enumlabel
@@ -274,7 +274,7 @@ ORDER BY enumsortorder
     }
 
     async fn fetch_composite_by_oid(
-        &mut self,
+        &self,
         oid: Oid,
         relation_id: Oid,
         name: String,
@@ -290,7 +290,7 @@ ORDER BY attnum
                 "#,
         )
         .bind(relation_id)
-        .fetch_all(&mut *self)
+        .fetch_all(&*self)
         .await?;
 
         let mut fields = Vec::new();
@@ -309,7 +309,7 @@ ORDER BY attnum
     }
 
     async fn fetch_domain_by_oid(
-        &mut self,
+        &self,
         oid: Oid,
         base_type: Oid,
         name: String,
@@ -323,7 +323,7 @@ ORDER BY attnum
         }))))
     }
 
-    async fn fetch_range_by_oid(&mut self, oid: Oid, name: String) -> Result<PgTypeInfo, Error> {
+    async fn fetch_range_by_oid(&self, oid: Oid, name: String) -> Result<PgTypeInfo, Error> {
         let element_oid: Oid = query_scalar(
             r#"
 SELECT rngsubtype
@@ -332,7 +332,7 @@ WHERE rngtypid = $1
                 "#,
         )
         .bind(oid)
-        .fetch_one(&mut *self)
+        .fetch_one(&*self)
         .await?;
 
         let element = self.maybe_fetch_type_info_by_oid(element_oid, true).await?;
@@ -344,7 +344,7 @@ WHERE rngtypid = $1
         }))))
     }
 
-    pub(crate) async fn resolve_type_id(&mut self, ty: &PgType) -> Result<Oid, Error> {
+    pub(crate) async fn resolve_type_id(&self, ty: &PgType) -> Result<Oid, Error> {
         if let Some(oid) = ty.try_oid() {
             return Ok(oid);
         }
@@ -357,7 +357,7 @@ WHERE rngtypid = $1
         }
     }
 
-    pub(crate) async fn fetch_type_id_by_name(&mut self, name: &str) -> Result<Oid, Error> {
+    pub(crate) async fn fetch_type_id_by_name(&self, name: &str) -> Result<Oid, Error> {
         if let Some(oid) = self.inner.type_cache.oid_by_name(name) {
             return Ok(oid);
         }
@@ -365,7 +365,7 @@ WHERE rngtypid = $1
         // language=SQL
         let (oid,): (Oid,) = query_as("SELECT $1::regtype::oid")
             .bind(name)
-            .fetch_optional(&mut *self)
+            .fetch_optional(&*self)
             .await?
             .ok_or_else(|| Error::TypeNotFound {
                 type_name: name.into(),
@@ -375,7 +375,7 @@ WHERE rngtypid = $1
         Ok(oid)
     }
 
-    pub(crate) async fn fetch_array_type_id(&mut self, array: &PgArrayOf) -> Result<Oid, Error> {
+    pub(crate) async fn fetch_array_type_id(&self, array: &PgArrayOf) -> Result<Oid, Error> {
         if let Some(oid) = self.inner.type_cache.array_oid_by_name(array) {
             return Ok(oid);
         }
@@ -384,7 +384,7 @@ WHERE rngtypid = $1
         let (elem_oid, array_oid): (Oid, Oid) =
             query_as("SELECT oid, typarray FROM pg_catalog.pg_type WHERE oid = $1::regtype::oid")
                 .bind(&*array.elem_name)
-                .fetch_optional(&mut *self)
+                .fetch_optional(&*self)
                 .await?
                 .ok_or_else(|| Error::TypeNotFound {
                     type_name: array.name.to_string(),
@@ -398,7 +398,8 @@ WHERE rngtypid = $1
 
     /// Check whether EXPLAIN statements are supported by the current connection
     fn is_explain_available(&self) -> bool {
-        let parameter_statuses = &self.inner.parameter_statuses;
+        // TODO(JoeydeWaal): errormsg
+        let parameter_statuses = &self.inner.parameter_statuses.read().expect("ERROR");
         let is_cockroachdb = parameter_statuses.contains_key("crdb_version");
         let is_materialize = parameter_statuses.contains_key("mz_version");
         let is_questdb = parameter_statuses.contains_key("questdb_version");
@@ -406,7 +407,7 @@ WHERE rngtypid = $1
     }
 
     pub(crate) async fn get_nullable_for_columns(
-        &mut self,
+        &self,
         stmt_id: StatementId,
         meta: &PgStatementMetadata,
     ) -> Result<Vec<Option<bool>>, Error> {
@@ -470,7 +471,7 @@ WHERE rngtypid = $1
 
         let mut nullables: Vec<Option<bool>> = nullable_query
             .build_query_scalar()
-            .fetch_all(&mut *self)
+            .fetch_all(&*self)
             .await
             .map_err(|e| {
                 err_protocol!(
@@ -499,7 +500,7 @@ WHERE rngtypid = $1
     /// This currently only marks columns that are on the inner half of an outer join
     /// and returns `None` for all others.
     async fn nullables_from_explain(
-        &mut self,
+        & self,
         stmt_id: StatementId,
         params_len: usize,
     ) -> Result<Vec<Option<bool>>, Error> {

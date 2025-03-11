@@ -1,4 +1,4 @@
-use crate::connection::worker::WaitType;
+use crate::connection::worker::PipeUntil;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
@@ -56,7 +56,7 @@ async fn prepare(
 
         // we ask for the server to immediately send us the result of the PARSE command
         message.write_msg(Sync {})?;
-        Ok(WaitType::ReadyForQuery)
+        Ok(PipeUntil::ReadyForQuery)
     })?;
 
     // indicates that the SQL query string is now successfully parsed and has semantic validity
@@ -119,46 +119,8 @@ async fn recv_desc_rows(conn: &mut ConnManager) -> Result<Option<RowDescription>
 }
 
 impl PgConnection {
-    // wait for CloseComplete to indicate a statement was closed
-    pub(super) async fn wait_for_close_complete(&mut self, mut count: usize) -> Result<(), Error> {
-        // we need to wait for the [CloseComplete] to be returned from the server
-        // while count > 0 {
-        //     match self.inner.chan.recv().await? {
-        //         message if message.format == BackendMessageFormat::PortalSuspended => {
-        //             // there was an open portal
-        //             // this can happen if the last time a statement was used it was not fully executed
-        //         }
-
-        //         message if message.format == BackendMessageFormat::CloseComplete => {
-        //             // successfully closed the statement (and freed up the server resources)
-        //             count -= 1;
-        //         }
-
-        //         message => {
-        //             return Err(err_protocol!(
-        //                 "expecting PortalSuspended or CloseComplete but received {:?}",
-        //                 message.format
-        //             ));
-        //         }
-        //     }
-        // }
-
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub(crate) fn write_sync(&mut self) {
-        // self.inner
-        //     .stream
-        //     .write_msg(message::Sync)
-        //     .expect("BUG: Sync should not be too big for protocol");
-
-        // all SYNC messages will return a ReadyForQuery
-        // self.inner.pending_ready_for_query_count += 1;
-    }
-
     async fn get_or_prepare<'a>(
-        &mut self,
+        &self,
         sql: &str,
         parameters: &[PgTypeInfo],
         // should we store the result of this prepare to the cache
@@ -167,19 +129,19 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-        if let Some(statement) = self.inner.cache_statement.get_mut(sql) {
-            return Ok((*statement).clone());
+        if let Some(statement) = self.inner.stmt_cache.get(sql) {
+            return Ok(statement);
         }
 
         let statement = prepare(self, sql, parameters, metadata).await?;
 
-        if store_to_cache && self.inner.cache_statement.is_enabled() {
-            if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
+        if store_to_cache {
+            if let Some((id, _)) = self.inner.stmt_cache.checked_insert(sql, statement.clone()) {
                 let mut manager = self.inner.chan.manager();
                 manager.send_message(|message| {
                     message.write_msg(Close::Statement(id))?;
                     message.write_msg(Sync {})?;
-                    Ok(WaitType::ReadyForQuery)
+                    Ok(PipeUntil::ReadyForQuery)
                 })?;
                 manager.wait_for_close_complete(1).await?;
                 manager.recv_ready_for_query().await?;
@@ -190,7 +152,7 @@ impl PgConnection {
     }
 
     pub(crate) async fn run<'e, 'c: 'e, 'q: 'e>(
-        &'c mut self,
+        &'c self,
         query: &'q str,
         arguments: Option<PgArguments>,
         persistent: bool,
@@ -235,6 +197,7 @@ impl PgConnection {
             // self.wait_until_ready().await?;
 
             manager.send_message(|messages| {
+                // bind to attach the arguments to the statement and create a portal
                 messages.write_msg(Bind {
                     portal: PortalId::UNNAMED,
                     statement,
@@ -244,39 +207,23 @@ impl PgConnection {
                     result_formats: &[PgValueFormat::Binary],
                 })?;
 
-                // bind to attach the arguments to the statement and create a portal
-                // self.inner.stream.write_msg(Bind {
-                //     portal: PortalId::UNNAMED,
-                //     statement,
-                //     formats: &[PgValueFormat::Binary],
-                //     num_params,
-                //     params: &arguments.buffer,
-                //     result_formats: &[PgValueFormat::Binary],
-                // })?;
-
-                messages.write_msg(message::Execute {
-                    portal: PortalId::UNNAMED,
-                    limit: 0,
-                })?;
                 // executes the portal up to the passed limit
                 // the protocol-level limit acts nearly identically to the `LIMIT` in SQL
-                // self.inner.stream.write_msg(message::Execute {
-                //     portal: PortalId::UNNAMED,
-                //     limit: limit.into(),
-                // })?;
+                //
                 // From https://www.postgresql.org/docs/current/protocol-flow.html:
                 //
                 // "An unnamed portal is destroyed at the end of the transaction, or as
                 // soon as the next Bind statement specifying the unnamed portal as
                 // destination is issued. (Note that a simple Query message also
                 // destroys the unnamed portal."
+                messages.write_msg(message::Execute {
+                    portal: PortalId::UNNAMED,
+                    limit: 0,
+                })?;
 
                 // we ask the database server to close the unnamed portal and free the associated resources
                 // earlier - after the execution of the current query.
                 messages.write_msg(Close::Portal(PortalId::UNNAMED))?;
-                // self.inner
-                //     .stream
-                //     .write_msg(Close::Portal(PortalId::UNNAMED))?;
 
                 // finally, [Sync] asks postgres to process the messages that we sent and respond with
                 // a [ReadyForQuery] message when it's completely done. Theoretically, we could send
@@ -284,20 +231,17 @@ impl PgConnection {
                 // is still serial but it would reduce round-trips. Some kind of builder pattern that is
                 // termed batching might suit this.
                 messages.write_msg(Sync {})?;
-                Ok(WaitType::ReadyForQuery)
+                Ok(PipeUntil::ReadyForQuery)
             })?;
-            // self.write_sync();
 
             // prepared statements are binary
             PgValueFormat::Binary
         } else {
             manager.send_message(|messages| {
                 messages.write_msg(Query(query))?;
-                Ok(WaitType::ReadyForQuery)
+                // Query will trigger a ReadyForQuery
+                Ok(PipeUntil::ReadyForQuery)
             })?;
-            // Query will trigger a ReadyForQuery
-            // self.inner.stream.write_msg(Query(query))?;
-            // self.inner.pending_ready_for_query_count += 1;
 
             // metadata starts out as "nothing"
             metadata = Arc::new(PgStatementMetadata::default());
@@ -305,8 +249,6 @@ impl PgConnection {
             // and unprepared statements are text
             PgValueFormat::Text
         };
-
-        // self.inner.stream.flush().await?;
 
         Ok(try_stream! {
             loop {
@@ -376,7 +318,6 @@ impl PgConnection {
 
                     BackendMessageFormat::ReadyForQuery => {
                         // processing of the query string is complete
-                        // self.handle_ready_for_query(message)?;
                         break;
                     }
 
@@ -394,7 +335,7 @@ impl PgConnection {
     }
 }
 
-impl<'c> Executor<'c> for &'c mut PgConnection {
+impl<'c> Executor<'c> for &'c PgConnection {
     type Database = Postgres;
 
     fn fetch_many<'e, 'q, E>(
@@ -495,5 +436,64 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
                 parameters: Some(Either::Left(metadata.parameters.clone())),
             })
         })
+    }
+}
+
+impl<'c> Executor<'c> for &'c mut PgConnection {
+    type Database = Postgres;
+
+    fn fetch_many<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxStream<
+        'e,
+        Result<
+            Either<
+                <Self::Database as sqlx_core::database::Database>::QueryResult,
+                <Self::Database as sqlx_core::database::Database>::Row,
+            >,
+            Error,
+        >,
+    >
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        <&PgConnection as Executor>::fetch_many(self, query)
+    }
+
+    fn fetch_optional<'e, 'q: 'e, E>(
+        self,
+        query: E,
+    ) -> BoxFuture<'e, Result<Option<<Self::Database as sqlx_core::database::Database>::Row>, Error>>
+    where
+        'c: 'e,
+        E: 'q + Execute<'q, Self::Database>,
+    {
+        <&PgConnection as Executor>::fetch_optional(self, query)
+    }
+
+    fn prepare_with<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+        parameters: &'e [<Self::Database as sqlx_core::database::Database>::TypeInfo],
+    ) -> BoxFuture<
+        'e,
+        Result<<Self::Database as sqlx_core::database::Database>::Statement<'q>, Error>,
+    >
+    where
+        'c: 'e,
+    {
+        <&PgConnection as Executor>::prepare_with(self, sql, parameters)
+    }
+
+    fn describe<'e, 'q: 'e>(
+        self,
+        sql: &'q str,
+    ) -> BoxFuture<'e, Result<Describe<Self::Database>, Error>>
+    where
+        'c: 'e,
+    {
+        <&PgConnection as Executor>::describe(self, sql)
     }
 }

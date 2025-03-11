@@ -1,13 +1,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::RwLock;
 
 use futures_core::future::BoxFuture;
+use stmt_cache::SharedStatementCache;
 use type_cache::TypeCache;
-use worker::{ConnManager, IoRequest, WaitType, WorkerConn};
+use worker::{ConnManager, IoRequest, PipeUntil, WorkerConn};
 
-use crate::common::StatementCache;
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
 use crate::message::{Close, Query, TransactionStatus};
@@ -23,6 +24,7 @@ pub(crate) mod describe;
 mod establish;
 mod executor;
 mod sasl;
+mod stmt_cache;
 mod stream;
 mod tls;
 mod type_cache;
@@ -44,9 +46,9 @@ pub struct PgConnectionInner {
     // wrapped in a buffered stream
     pub(crate) stream: PgStream,
 
-    pub(crate) parameter_statuses: BTreeMap<String, String>,
+    pub(crate) parameter_statuses: RwLock<BTreeMap<String, String>>,
 
-    pub(crate) server_version_num: Option<u32>,
+    pub(crate) server_version_num: Option<AtomicU32>,
 
     // process id of this backend
     // used to send cancel requests
@@ -63,16 +65,14 @@ pub struct PgConnectionInner {
     stmt_id_manager: StatementIdManager,
 
     // cache statement by query string to the id and columns
-    cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
+    // cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
+    stmt_cache: SharedStatementCache,
 
     type_cache: TypeCache,
 
-    // number of ReadyForQuery messages that we are currently expecting
-    pub(crate) pending_ready_for_query_count: usize,
-
     // current transaction status
     transaction_status: TransactionStatus,
-    pub(crate) transaction_depth: usize,
+    pub(crate) transaction_depth: AtomicUsize,
 
     log_settings: LogSettings,
 }
@@ -80,22 +80,9 @@ pub struct PgConnectionInner {
 impl PgConnection {
     /// the version number of the server in `libpq` format
     pub fn server_version_num(&self) -> Option<u32> {
-        todo!();
-        // self.inner.stream.server_version_num
+        let version = self.inner.server_version_num.as_ref()?;
+        Some(version.load(Ordering::Relaxed))
     }
-
-    // #[inline(always)]
-    // fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
-    // self.inner.pending_ready_for_query_count = self
-    //     .inner
-    //     .pending_ready_for_query_count
-    //     .checked_sub(1)
-    //     .ok_or_else(|| err_protocol!("received more ReadyForQuery messages than expected"))?;
-
-    // self.inner.transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
-
-    // Ok(())
-    // }
 
     /// Queue a simple query (not prepared) to execute the next time this connection is used.
     ///
@@ -105,12 +92,25 @@ impl PgConnection {
         let mut manager = self.inner.chan.manager();
         manager.send_message(|buff| {
             buff.write_msg(Query(query))?;
-            Ok(WaitType::ReadyForQuery)
+            Ok(PipeUntil::ReadyForQuery)
         })?;
-        // self.inner.stream.write_msg(Query(query))?;
-        // self.inner.pending_ready_for_query_count += 1;
 
         Ok(manager)
+    }
+
+    pub(crate) fn transaction_depth(&self) -> usize {
+        // TODO(JoeydeWaal): Ordering
+        self.inner.transaction_depth.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn increment_transaction_depth(&self) {
+        // TODO(JoeydeWaal): Ordering
+        self.inner.transaction_depth.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn decrement_transaction_depth(&self) {
+        // TODO(JoeydeWaal): Ordering
+        self.inner.transaction_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
     pub(crate) fn unbounded_send(&self, req: IoRequest) -> sqlx_core::Result<()> {
@@ -175,7 +175,7 @@ impl Connection for PgConnection {
             manager.send_message(|message| {
                 // The simplest call-and-response that's possible.
                 message.write_sync();
-                Ok(WaitType::ReadyForQuery)
+                Ok(PipeUntil::ReadyForQuery)
             })?;
             manager.recv_ready_for_query().await?;
             Ok(())
@@ -200,7 +200,7 @@ impl Connection for PgConnection {
     }
 
     fn cached_statements_size(&self) -> usize {
-        self.inner.cache_statement.len()
+        self.inner.stmt_cache.cached_statements_size()
     }
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
@@ -212,17 +212,19 @@ impl Connection for PgConnection {
             let mut manager = self.inner.chan.manager();
 
             manager.send_message(|messages| {
-                while let Some((id, _)) = self.inner.cache_statement.remove_lru() {
+                let mut stmt_cache = self.inner.stmt_cache.lock();
+                while let Some((id, _)) = stmt_cache.remove_lru() {
                     messages.write_msg(Close::Statement(id))?;
                     cleared += 1;
                 }
+                drop(stmt_cache);
 
                 if cleared > 0 {
                     messages.write_sync();
-                    return Ok(WaitType::ReadyForQuery);
+                    return Ok(PipeUntil::ReadyForQuery);
                 }
 
-                Ok(WaitType::NumMessages { num_responses: 0 })
+                Ok(PipeUntil::NumMessages { num_responses: 0 })
             })?;
 
             if cleared > 0 {
@@ -244,7 +246,6 @@ impl Connection for PgConnection {
 
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
-        // !self.inner.stream.write_buffer().is_empty()
         false
     }
 }

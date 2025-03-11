@@ -5,18 +5,17 @@ use futures_core::future::BoxFuture;
 
 use futures_core::stream::BoxStream;
 use futures_core::Stream;
-use sqlx_core::bytes::{BufMut, Bytes};
+use sqlx_core::bytes::Bytes;
 
 use crate::connection::worker::ConnManager;
 use crate::connection::PgConnection;
 use crate::error::{Error, Result};
-use crate::io::AsyncRead;
 use crate::message::{
     BackendMessageFormat, CommandComplete, CopyData, CopyDone, CopyFail, CopyInResponse,
     CopyOutResponse, CopyResponseData, Query, ReadyForQuery,
 };
 use crate::pool::{Pool, PoolConnection};
-use crate::{Postgres, WaitType};
+use crate::{PipeUntil, Postgres};
 
 impl PgConnection {
     /// Issue a `COPY FROM STDIN` statement and transition the connection to streaming data
@@ -155,7 +154,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         manager.send_message(|buff| {
             buff.write_msg(Query(statement))?;
             // FIXME
-            Ok(WaitType::ReadyForQuery)
+            Ok(PipeUntil::ReadyForQuery)
         })?;
 
         let response = match manager.recv_expect::<CopyInResponse>().await {
@@ -207,7 +206,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
             self.manager.send_message(|buff| {
                 buff.write_msg(CopyData(chunk))?;
-                Ok(WaitType::NumMessages { num_responses: 0 })
+                Ok(PipeUntil::NumMessages { num_responses: 0 })
             })?;
         }
 
@@ -266,7 +265,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         self.manager.send_message(|buff| {
             buff.write_msg(CopyFail::new(msg))?;
             // TODO: Joey
-            Ok(WaitType::ReadyForQuery)
+            Ok(PipeUntil::ReadyForQuery)
         })?;
 
         match self.manager.recv().await {
@@ -294,7 +293,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     pub async fn finish(mut self) -> Result<u64> {
         self.manager.send_message(|buff| {
             buff.write_msg(CopyDone)?;
-            Ok(WaitType::ReadyForQuery)
+            Ok(PipeUntil::ReadyForQuery)
         })?;
 
         let cc: CommandComplete = match self.manager.recv_expect().await {
@@ -333,7 +332,7 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
 
     manager.send_message(|buff| {
         buff.write_msg(Query(statement))?;
-        Ok(WaitType::ReadyForQuery)
+        Ok(PipeUntil::ReadyForQuery)
     })?;
 
     let _: CopyOutResponse = manager.recv_expect().await?;
@@ -384,13 +383,16 @@ where
     }
 
     fn into_stream(self) -> BoxStream<'c, Result<Bytes>> {
-        Box::pin(futures_util::stream::try_unfold(self, |mut this| async move {
-            let item = this.next().await?;
-            if let Some(data) = item {
-                return Ok(Some((data, this)));
-            } else {
-                return Ok(None);
-            }
-        }))
+        Box::pin(futures_util::stream::try_unfold(
+            self,
+            |mut this| async move {
+                let item = this.next().await?;
+                if let Some(data) = item {
+                    return Ok(Some((data, this)));
+                } else {
+                    return Ok(None);
+                }
+            },
+        ))
     }
 }

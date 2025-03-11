@@ -1,5 +1,4 @@
-use crate::connection::stream::PgStream;
-use crate::connection::worker::WaitType;
+use crate::connection::worker::PipeUntil;
 use crate::error::Error;
 use crate::message::{
     Authentication, AuthenticationSasl, EncodeMessage, SaslInitialResponse, SaslResponse,
@@ -22,7 +21,6 @@ const NONCE_ATTR: &str = "r";
 
 pub(crate) async fn authenticate(
     manager: &mut ConnManager,
-    stream: &mut PgStream,
     options: &PgConnectOptions,
     data: AuthenticationSasl,
 ) -> Result<(), Error> {
@@ -78,15 +76,8 @@ pub(crate) async fn authenticate(
             response: &client_first_message,
             plus: false,
         }))?;
-        Ok(WaitType::NumMessages { num_responses: 1 })
+        Ok(PipeUntil::NumMessages { num_responses: 1 })
     })?;
-
-    // stream
-    //     .send(SaslInitialResponse {
-    //         response: &client_first_message,
-    //         plus: false,
-    //     })
-    //     .await?;
 
     let cont = match manager.recv_expect().await? {
         Authentication::SaslContinue(data) => data,
@@ -160,10 +151,9 @@ pub(crate) async fn authenticate(
 
     manager.send_message(|message| {
         message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
-        Ok(WaitType::ReadyForQuery)
+        Ok(PipeUntil::ReadyForQuery)
     })?;
 
-    // stream.send(SaslResponse(&client_final_message)).await?;
 
     let data = match manager.recv_expect().await? {
         Authentication::SaslFinal(data) => data,
