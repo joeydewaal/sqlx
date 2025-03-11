@@ -133,8 +133,6 @@ impl PgConnection {
                 BackendMessageFormat::ReadyForQuery => {
                     // start-up is completed. The frontend can now issue commands
                     transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
-                    println!("Waited for rfq");
-
                     break;
                 }
 
@@ -146,7 +144,6 @@ impl PgConnection {
                 }
             }
         }
-        println!("Done establish");
 
         Ok(PgConnection {
             inner: Box::new(PgConnectionInner {
