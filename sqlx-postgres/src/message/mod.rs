@@ -56,7 +56,6 @@ use sqlx_core::io::ProtocolEncode;
 pub use ssl_request::SslRequest;
 pub use startup::Startup;
 pub use sync::Sync;
-pub use terminate::Terminate;
 
 // Note: we can't use the same enum for both frontend and backend message formats
 // because there are duplicated format codes between them.

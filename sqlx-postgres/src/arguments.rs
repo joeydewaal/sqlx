@@ -109,7 +109,7 @@ impl PgArguments {
     // This should only go out and ask postgres if we have not seen the type name yet
     pub(crate) async fn apply_patches(
         &mut self,
-        conn: &mut PgConnection,
+        conn: &PgConnection,
         parameters: &[PgTypeInfo],
     ) -> Result<(), Error> {
         let PgArgumentBuffer {

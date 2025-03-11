@@ -26,11 +26,11 @@ impl TypeCache {
         }
     }
 
-    pub fn write<'a>(&'a self) -> RwLockWriteGuard<'a, TypeCacheMut> {
+    fn write<'a>(&'a self) -> RwLockWriteGuard<'a, TypeCacheMut> {
         self.inner.write().expect("ERROR")
     }
 
-    pub fn read<'a>(&'a self) -> RwLockReadGuard<'a, TypeCacheMut> {
+    fn read<'a>(&'a self) -> RwLockReadGuard<'a, TypeCacheMut> {
         self.inner.read().expect("ERROR")
     }
 

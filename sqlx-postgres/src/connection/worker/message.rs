@@ -4,7 +4,7 @@ use sqlx_core::{io::ProtocolEncode, Error};
 use crate::message::{self, EncodeMessage, FrontendMessage, ReceivedMessage};
 
 #[derive(Debug, PartialEq)]
-pub enum WaitType {
+pub enum PipeUntil {
     NumMessages { num_responses: usize },
     ReadyForQuery,
 }
@@ -13,13 +13,13 @@ pub enum WaitType {
 pub struct IoRequest {
     pub chan: UnboundedSender<ReceivedMessage>,
     pub data: Vec<u8>,
-    pub ends_at: WaitType,
+    pub ends_at: PipeUntil,
 }
 
 impl IoRequest {
     pub fn decrease_num_request(&mut self) {
         match &mut self.ends_at {
-            WaitType::NumMessages { num_responses } => {
+            PipeUntil::NumMessages { num_responses } => {
                 *num_responses -= 1;
             }
             _ => {}
@@ -70,7 +70,7 @@ impl MessageBuf {
         self.write(EncodeMessage(message))
     }
 
-    pub fn finish(self, ends_at: WaitType) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
+    pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
         let (tx, rx) = unbounded();
         let req = IoRequest {
             ends_at,
