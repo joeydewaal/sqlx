@@ -42,7 +42,7 @@ impl MigrateDatabase for Postgres {
     fn create_database(url: &str) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             let (options, database) = parse_for_maintenance(url)?;
-            let mut conn = options.connect().await?;
+            let conn = options.connect().await?;
 
             let _ = conn
                 .execute(&*format!(
@@ -73,7 +73,7 @@ impl MigrateDatabase for Postgres {
     fn drop_database(url: &str) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             let (options, database) = parse_for_maintenance(url)?;
-            let mut conn = options.connect().await?;
+            let conn = options.connect().await?;
 
             let _ = conn
                 .execute(&*format!(
