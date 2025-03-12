@@ -5,7 +5,6 @@ use std::{
     ops::ControlFlow,
     pin::Pin,
     task::{Context, Poll},
-    time::Instant,
 };
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver};

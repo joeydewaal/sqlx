@@ -1,12 +1,12 @@
 use futures_channel::mpsc::UnboundedReceiver;
-use futures_util::StreamExt;
+use futures_util::{SinkExt as _, StreamExt};
 use log::Level;
 use sqlx_core::Error;
 use std::str::FromStr;
 
 use crate::{
     message::{
-        BackendMessage, BackendMessageFormat, Notice, ParameterStatus, ReadyForQuery,
+        BackendMessage, BackendMessageFormat, Notice, Notification, ParameterStatus, ReadyForQuery,
         ReceivedMessage,
     },
     PgConnection, PgDatabaseError, PgSeverity,
@@ -78,11 +78,15 @@ impl<'c> ConnManager<'c> {
         Ok(())
     }
 
+    pub(crate) async fn recv_unchecked(&mut self) -> Result<ReceivedMessage, Error> {
+        self.receiver.next().await.ok_or(Error::WorkerCrashed)
+    }
+
     // Get the next message from the server
     // May wait for more data from the server
     pub(crate) async fn recv(&mut self) -> Result<ReceivedMessage, Error> {
         loop {
-            let message = self.receiver.next().await.ok_or(Error::WorkerCrashed)?;
+            let message = self.recv_unchecked().await?;
             match message.format {
                 BackendMessageFormat::ErrorResponse => {
                     // An error returned from the database server.
@@ -90,12 +94,12 @@ impl<'c> ConnManager<'c> {
                 }
 
                 BackendMessageFormat::NotificationResponse => {
-                    // if let Some(buffer) = &mut self.notifications {
-                    //     let notification: Notification = message.decode()?;
-                    //     let _ = buffer.send(notification).await;
+                    if let Some(buffer) = &self.conn.inner.notifications {
+                        let notification: Notification = message.decode()?;
+                        let _ = buffer.unbounded_send(notification);
 
-                    continue;
-                    // }
+                        continue;
+                    }
                 }
 
                 BackendMessageFormat::ParameterStatus => {

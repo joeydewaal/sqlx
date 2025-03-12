@@ -21,8 +21,6 @@ use super::PgConnectionInner;
 impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
-        let stream = PgStream::connect(options).await?;
-
         let stream_bg = PgStream::connect(options).await?;
 
         let chan = Worker::spawn(stream_bg);
@@ -33,8 +31,8 @@ impl PgConnection {
             inner: Box::new(PgConnectionInner {
                 chan,
                 parameter_statuses: BTreeMap::new().into(),
+                notifications: None,
                 server_version_num: AtomicU32::new(0),
-                stream,
                 process_id: 0,
                 secret_key: 0,
                 transaction_status: TransactionStatus::Idle,
