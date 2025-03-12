@@ -17,7 +17,7 @@ use crate::executor::{Execute, Executor};
 use crate::message::{BackendMessageFormat, Notification};
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
-use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
+use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, PipeUntil, Postgres};
 
 /// A stream of asynchronous notifications from Postgres.
 ///
@@ -62,7 +62,7 @@ impl PgListener {
 
         // Setup a notification buffer
         let (sender, receiver) = mpsc::unbounded();
-        connection.inner.stream.notifications = Some(sender);
+        connection.inner.notifications = Some(sender);
 
         Ok(Self {
             pool: pool.clone(),
@@ -173,7 +173,7 @@ impl PgListener {
     async fn connect_if_needed(&mut self) -> Result<(), Error> {
         if self.connection.is_none() {
             let mut connection = self.pool.acquire().await?;
-            connection.inner.stream.notifications = self.buffer_tx.take();
+            connection.inner.notifications = self.buffer_tx.take();
 
             connection
                 .execute(&*build_listen_all_query(&self.channels))
@@ -238,6 +238,7 @@ impl PgListener {
     /// ```rust,no_run
     /// # use sqlx::postgres::PgListener;
     /// #
+
     /// # sqlx::__rt::test_block_on(async move {
     /// # let mut listener = PgListener::connect("postgres:// ...").await?;
     /// loop {
@@ -264,7 +265,12 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let next_message = self.connection().await?.inner.stream.recv_unchecked();
+            let mut manager = self
+                .connection()
+                .await?
+                .pipe_message(|_| Ok(PipeUntil::NumMessages { num_responses: 1 }))?;
+
+            let next_message = manager.recv_unchecked();
 
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
@@ -290,7 +296,7 @@ impl PgListener {
                     ) =>
                 {
                     if let Some(mut conn) = self.connection.take() {
-                        self.buffer_tx = conn.inner.stream.notifications.take();
+                        self.buffer_tx = conn.inner.notifications.take();
                         // Close the connection in a background task, so we can continue.
                         conn.close_on_drop();
                     }
