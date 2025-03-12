@@ -120,7 +120,7 @@ pub struct ReceivedMessage {
 
 impl ReceivedMessage {
     #[inline]
-    pub fn decode<T>(self) -> Result<T, Error>
+    pub(crate) fn decode<T>(self) -> Result<T, Error>
     where
         T: BackendMessage,
     {
