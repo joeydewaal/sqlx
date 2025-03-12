@@ -1,50 +1,53 @@
-use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
+use log::Level;
 use sqlx_core::Error;
 use std::str::FromStr;
 
 use crate::{
     message::{
-        BackendMessage, BackendMessageFormat, ParameterStatus, ReadyForQuery, ReceivedMessage,
+        BackendMessage, BackendMessageFormat, Notice, ParameterStatus, ReadyForQuery,
+        ReceivedMessage,
     },
-    PgDatabaseError,
+    PgConnection, PgDatabaseError, PgSeverity,
 };
 
-use super::{message::PipeUntil, IoRequest, MessageBuf};
-
-pub struct ConnManager {
-    chan: UnboundedSender<IoRequest>,
-    last_receiver: Option<UnboundedReceiver<ReceivedMessage>>,
+pub struct ConnManager<'c> {
+    conn: &'c PgConnection,
+    receiver: UnboundedReceiver<ReceivedMessage>,
 }
 
-impl ConnManager {
-    pub fn new(chan: UnboundedSender<IoRequest>) -> Self {
-        Self {
-            chan,
-            last_receiver: None,
-        }
+impl<'c> ConnManager<'c> {
+    pub fn new(
+        receiver: UnboundedReceiver<ReceivedMessage>,
+        conn: &'c PgConnection,
+    ) -> ConnManager<'c> {
+        Self { receiver, conn }
     }
 
-    pub fn send_message<F>(&mut self, callback: F) -> sqlx_core::Result<()>
-    where
-        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
-    {
-        let mut buffer = MessageBuf::new();
-        let wait_type = (callback)(&mut buffer)?;
-        let (request, receiver) = buffer.finish(wait_type);
-        self.chan
-            .unbounded_send(request)
-            .map_err(|_| Error::WorkerCrashed)?;
-        self.last_receiver = Some(receiver);
-        Ok(())
+    pub fn into_inner(self) -> (&'c PgConnection, UnboundedReceiver<ReceivedMessage>) {
+        (self.conn, self.receiver)
     }
+
     // Expect a specific type and format
-    pub async fn recv_expect<B: BackendMessage>(&mut self) -> Result<B, Error> {
+    pub(crate) async fn recv_expect<B: BackendMessage>(&mut self) -> Result<B, Error> {
         self.recv().await?.decode()
     }
 
     pub async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
         let _: ReadyForQuery = self.recv_expect().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn wait_ready_for_query(&mut self) -> Result<(), Error> {
+        loop {
+            let message = self.recv().await?;
+
+            if let BackendMessageFormat::ReadyForQuery = message.format {
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -79,12 +82,7 @@ impl ConnManager {
     // May wait for more data from the server
     pub(crate) async fn recv(&mut self) -> Result<ReceivedMessage, Error> {
         loop {
-            let x = self
-                .last_receiver
-                .as_mut()
-                .ok_or(sqlx_core::Error::WorkerCrashed)?;
-
-            let message = x.next().await.ok_or(Error::WorkerCrashed)?;
+            let message = self.receiver.next().await.ok_or(Error::WorkerCrashed)?;
             match message.format {
                 BackendMessageFormat::ErrorResponse => {
                     // An error returned from the database server.
@@ -107,15 +105,16 @@ impl ConnManager {
                     let ParameterStatus { name, value } = message.decode()?;
                     // TODO: handle `client_encoding`, `DateStyle` change
 
-                    dbg!(&name, &value);
                     match name.as_str() {
                         "server_version" => {
-                            if let Some(_version) = parse_server_version(&value) {
-                                // self.into
+                            if let Some(version) = parse_server_version(&value) {
+                                self.conn.set_server_version_num(version);
                             }
                         }
                         _ => {
-                            // self.parameter_statuses.insert(name, value);
+                            let mut param_statusses =
+                                self.conn.inner.parameter_statuses.write().expect("");
+                            param_statusses.insert(name, value);
                         }
                     }
 
@@ -126,32 +125,31 @@ impl ConnManager {
                     // do we need this to be more configurable?
                     // if you are reading this comment and think so, open an issue
 
-                    // let notice: Notice = message.decode()?;
+                    let notice: Notice = message.decode()?;
+                    let (log_level, tracing_level) = match notice.severity() {
+                        PgSeverity::Fatal | PgSeverity::Panic | PgSeverity::Error => {
+                            (Level::Error, tracing::Level::ERROR)
+                        }
+                        PgSeverity::Warning => (Level::Warn, tracing::Level::WARN),
+                        PgSeverity::Notice => (Level::Info, tracing::Level::INFO),
+                        PgSeverity::Debug => (Level::Debug, tracing::Level::DEBUG),
+                        PgSeverity::Info | PgSeverity::Log => (Level::Trace, tracing::Level::TRACE),
+                    };
 
-                    // let (log_level, tracing_level) = match notice.severity() {
-                    //     PgSeverity::Fatal | PgSeverity::Panic | PgSeverity::Error => {
-                    //         (Level::Error, tracing::Level::ERROR)
-                    //     }
-                    //     PgSeverity::Warning => (Level::Warn, tracing::Level::WARN),
-                    //     PgSeverity::Notice => (Level::Info, tracing::Level::INFO),
-                    //     PgSeverity::Debug => (Level::Debug, tracing::Level::DEBUG),
-                    //     PgSeverity::Info | PgSeverity::Log => (Level::Trace, tracing::Level::TRACE),
-                    // };
-
-                    // let log_is_enabled = log::log_enabled!(
-                    //     target: "sqlx::postgres::notice",
-                    //     log_level
-                    // ) || sqlx_core::private_tracing_dynamic_enabled!(
-                    //     target: "sqlx::postgres::notice",
-                    //     tracing_level
-                    // );
-                    // if log_is_enabled {
-                    //     sqlx_core::private_tracing_dynamic_event!(
-                    //         target: "sqlx::postgres::notice",
-                    //         tracing_level,
-                    //         message = notice.message()
-                    //     );
-                    // }
+                    let log_is_enabled = log::log_enabled!(
+                        target: "sqlx::postgres::notice",
+                        log_level
+                    ) || sqlx_core::private_tracing_dynamic_enabled!(
+                        target: "sqlx::postgres::notice",
+                        tracing_level
+                    );
+                    if log_is_enabled {
+                        sqlx_core::private_tracing_dynamic_event!(
+                            target: "sqlx::postgres::notice",
+                            tracing_level,
+                            message = notice.message()
+                        );
+                    }
 
                     continue;
                 }
