@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use futures_core::future::BoxFuture;
 use stmt_cache::SharedStatementCache;
 use type_cache::TypeCache;
-use worker::{ConnManager, IoRequest, PipeUntil, WorkerConn};
+use worker::{ConnManager, MessageBuf, PipeUntil, WorkerConn};
 
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
@@ -48,7 +48,7 @@ pub struct PgConnectionInner {
 
     pub(crate) parameter_statuses: RwLock<BTreeMap<String, String>>,
 
-    pub(crate) server_version_num: Option<AtomicU32>,
+    pub(crate) server_version_num: AtomicU32,
 
     // process id of this backend
     // used to send cancel requests
@@ -71,6 +71,7 @@ pub struct PgConnectionInner {
     type_cache: TypeCache,
 
     // current transaction status
+    #[allow(dead_code)]
     transaction_status: TransactionStatus,
     pub(crate) transaction_depth: AtomicUsize,
 
@@ -80,8 +81,14 @@ pub struct PgConnectionInner {
 impl PgConnection {
     /// the version number of the server in `libpq` format
     pub fn server_version_num(&self) -> Option<u32> {
-        let version = self.inner.server_version_num.as_ref()?;
-        Some(version.load(Ordering::Relaxed))
+        let version = self.inner.server_version_num.load(Ordering::Relaxed);
+        (version != 0).then(|| version)
+    }
+
+    pub(super) fn set_server_version_num(&self, version_num: u32) {
+        self.inner
+            .server_version_num
+            .store(version_num, Ordering::Relaxed);
     }
 
     /// Queue a simple query (not prepared) to execute the next time this connection is used.
@@ -89,13 +96,10 @@ impl PgConnection {
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
     pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager, Error> {
-        let mut manager = self.inner.chan.manager();
-        manager.send_message(|buff| {
+        self.pipe_message(|buff| {
             buff.write_msg(Query(query))?;
             Ok(PipeUntil::ReadyForQuery)
-        })?;
-
-        Ok(manager)
+        })
     }
 
     pub(crate) fn transaction_depth(&self) -> usize {
@@ -113,12 +117,20 @@ impl PgConnection {
         self.inner.transaction_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn unbounded_send(&self, req: IoRequest) -> sqlx_core::Result<()> {
+    pub fn pipe_message<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
+    where
+        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
+    {
+        let mut buffer = MessageBuf::new();
+        let wait_type = (callback)(&mut buffer)?;
+        let (request, receiver) = buffer.finish(wait_type);
         self.inner
             .chan
             .chan
-            .unbounded_send(req)
-            .map_err(|_| sqlx_core::Error::WorkerCrashed)
+            .unbounded_send(request)
+            .map_err(|_| Error::WorkerCrashed)?;
+
+        Ok(ConnManager::new(receiver, &self))
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
@@ -171,9 +183,7 @@ impl Connection for PgConnection {
         // self.execute("/* SQLx ping */").map_ok(|_| ()).boxed()
 
         Box::pin(async move {
-            let mut manager = self.inner.chan.manager();
-
-            manager.send_message(|message| {
+            let mut manager = self.pipe_message(|message| {
                 // The simplest call-and-response that's possible.
                 message.write_sync();
                 Ok(PipeUntil::ReadyForQuery)
@@ -210,9 +220,7 @@ impl Connection for PgConnection {
 
             let mut cleared = 0_usize;
 
-            let mut manager = self.inner.chan.manager();
-
-            manager.send_message(|messages| {
+            let mut manager = self.pipe_message(|messages| {
                 let mut stmt_cache = self.inner.stmt_cache.lock();
                 while let Some((id, _)) = stmt_cache.remove_lru() {
                     messages.write_msg(Close::Statement(id))?;

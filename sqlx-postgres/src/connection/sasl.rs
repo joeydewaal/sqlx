@@ -12,6 +12,7 @@ use stringprep::saslprep;
 use base64::prelude::{Engine as _, BASE64_STANDARD};
 
 use super::worker::ConnManager;
+use super::PgConnection;
 
 const GS2_HEADER: &str = "n,,";
 const CHANNEL_ATTR: &str = "c";
@@ -19,11 +20,11 @@ const USERNAME_ATTR: &str = "n";
 const CLIENT_PROOF_ATTR: &str = "p";
 const NONCE_ATTR: &str = "r";
 
-pub(crate) async fn authenticate(
-    manager: &mut ConnManager,
+pub(crate) async fn authenticate<'c>(
+    conn: &'c PgConnection,
     options: &PgConnectOptions,
     data: AuthenticationSasl,
-) -> Result<(), Error> {
+) -> Result<ConnManager<'c>, Error> {
     let mut has_sasl = false;
     let mut has_sasl_plus = false;
     let mut unknown = Vec::new();
@@ -71,7 +72,7 @@ pub(crate) async fn authenticate(
 
     let client_first_message = format!("{GS2_HEADER}{client_first_message_bare}");
 
-    manager.send_message(|message| {
+    let mut manager = conn.pipe_message(|message| {
         message.write(EncodeMessage(SaslInitialResponse {
             response: &client_first_message,
             plus: false,
@@ -89,7 +90,6 @@ pub(crate) async fn authenticate(
             ));
         }
     };
-    println!("got response");
 
     // SaltedPassword := Hi(Normalize(password), salt, i)
     let salted_password = hi(
@@ -149,11 +149,10 @@ pub(crate) async fn authenticate(
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
     BASE64_STANDARD.encode_string(client_proof, &mut client_final_message);
 
-    manager.send_message(|message| {
+    manager = conn.pipe_message(|message| {
         message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
         Ok(PipeUntil::ReadyForQuery)
     })?;
-
 
     let data = match manager.recv_expect().await? {
         Authentication::SaslFinal(data) => data,
@@ -162,12 +161,11 @@ pub(crate) async fn authenticate(
             return Err(err_protocol!("expected SASLFinal but received {:?}", auth));
         }
     };
-    println!("Got sasl final");
 
     // authentication is only considered valid if this verification passes
     mac.verify_slice(&data.verifier).map_err(Error::protocol)?;
 
-    Ok(())
+    Ok(manager)
 }
 
 // nonce is a sequence of random printable bytes

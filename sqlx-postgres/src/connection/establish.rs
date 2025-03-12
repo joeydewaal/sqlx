@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicUsize};
 
 use crate::connection::stmt_cache::SharedStatementCache;
 use crate::connection::{sasl, stream::PgStream};
@@ -7,6 +7,7 @@ use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
 use crate::message::{
     Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
+    TransactionStatus,
 };
 use crate::{PgConnectOptions, PgConnection};
 
@@ -28,6 +29,22 @@ impl PgConnection {
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
+        let mut conn = PgConnection {
+            inner: Box::new(PgConnectionInner {
+                chan,
+                parameter_statuses: BTreeMap::new().into(),
+                server_version_num: AtomicU32::new(0),
+                stream,
+                process_id: 0,
+                secret_key: 0,
+                transaction_status: TransactionStatus::Idle,
+                transaction_depth: AtomicUsize::new(0),
+                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
+                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
+                type_cache: TypeCache::new(),
+                log_settings: options.log_settings.clone(),
+            }),
+        };
 
         let mut params = vec![
             // Sets the display format for date and time values,
@@ -52,9 +69,7 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        let mut manager = chan.manager();
-
-        manager.send_message(|message| {
+        let mut manager = conn.pipe_message(|message| {
             message.write(Startup {
                 username: Some(&options.username),
                 database: options.database.as_deref(),
@@ -85,7 +100,7 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        manager.send_message(|message| {
+                        manager = conn.pipe_message(|message| {
                             message.write_msg(Password::Cleartext(
                                 options.password.as_deref().unwrap_or_default(),
                             ))?;
@@ -97,7 +112,7 @@ impl PgConnection {
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
-                        manager.send_message(|message| {
+                        manager = conn.pipe_message(|message| {
                             message.write_msg(Password::Md5 {
                                 username: &options.username,
                                 password: options.password.as_deref().unwrap_or_default(),
@@ -109,7 +124,7 @@ impl PgConnection {
                     }
 
                     Authentication::Sasl(body) => {
-                        sasl::authenticate(&mut manager, options, body).await?;
+                        manager = sasl::authenticate(&conn, options, body).await?;
                     }
 
                     method => {
@@ -145,21 +160,10 @@ impl PgConnection {
             }
         }
 
-        Ok(PgConnection {
-            inner: Box::new(PgConnectionInner {
-                chan,
-                parameter_statuses: BTreeMap::new().into(),
-                server_version_num: None,
-                stream,
-                process_id,
-                secret_key,
-                transaction_status,
-                transaction_depth: AtomicUsize::new(0),
-                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
-                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
-                type_cache: TypeCache::new(),
-                log_settings: options.log_settings.clone(),
-            }),
-        })
+        conn.inner.process_id = process_id;
+        conn.inner.secret_key = secret_key;
+        conn.inner.transaction_status = transaction_status;
+
+        Ok(conn)
     }
 }

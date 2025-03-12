@@ -500,7 +500,7 @@ WHERE rngtypid = $1
     /// This currently only marks columns that are on the inner half of an outer join
     /// and returns `None` for all others.
     async fn nullables_from_explain(
-        & self,
+        &self,
         stmt_id: StatementId,
         params_len: usize,
     ) -> Result<Vec<Option<bool>>, Error> {
