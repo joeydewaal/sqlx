@@ -4,6 +4,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
+use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
 use stmt_cache::SharedStatementCache;
 use type_cache::TypeCache;
@@ -11,7 +12,7 @@ use worker::{ConnManager, MessageBuf, PipeUntil, WorkerConn};
 
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
-use crate::message::{Close, Query, TransactionStatus};
+use crate::message::{Close, Notification, Query, TransactionStatus};
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
 use crate::{PgConnectOptions, Postgres};
@@ -44,7 +45,8 @@ pub struct PgConnectionInner {
     // underlying TCP or UDS stream,
     // wrapped in a potentially TLS stream,
     // wrapped in a buffered stream
-    pub(crate) stream: PgStream,
+    // pub(crate) stream: PgStream,
+    pub(crate) notifications: Option<UnboundedSender<Notification>>,
 
     pub(crate) parameter_statuses: RwLock<BTreeMap<String, String>>,
 
