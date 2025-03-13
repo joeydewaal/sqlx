@@ -129,7 +129,13 @@ impl PgConnection {
         }
         println!("preparing");
 
-        let statement = prepare(self, sql, parameters, metadata).await?;
+        let statement = match prepare(self, sql, parameters, metadata).await {
+            Ok(s) => s,
+            Err(e) => {
+                self.inner.stmt_cache.remove_notify(sql);
+                return Err(e);
+            }
+        };
 
         if store_to_cache {
             if let Some((id, _)) = self.inner.stmt_cache.checked_insert(sql, statement.clone()) {
@@ -140,6 +146,8 @@ impl PgConnection {
                 manager.wait_for_close_complete(1).await?;
                 manager.recv_ready_for_query().await?;
             }
+        } else {
+            self.inner.stmt_cache.remove_notify(sql);
         }
 
         Ok(statement)
@@ -237,7 +245,9 @@ impl PgConnection {
 
         Ok(try_stream! {
             loop {
+                println!("rECV");
                 let message = manager.recv().await?;
+                println!("rECV");
 
                 match message.format {
                     BackendMessageFormat::BindComplete
@@ -302,7 +312,6 @@ impl PgConnection {
                     }
 
                     BackendMessageFormat::ReadyForQuery => {
-
                         // processing of the query string is complete
                         break;
                     }
@@ -334,6 +343,7 @@ impl<'c> Executor<'c> for &'c PgConnection {
         'q: 'e,
         E: 'q,
     {
+        println!("e1");
         let sql = query.sql();
         // False positive: https://github.com/rust-lang/rust-clippy/issues/12560
         #[allow(clippy::map_clone)]
@@ -343,7 +353,9 @@ impl<'c> Executor<'c> for &'c PgConnection {
 
         Box::pin(try_stream! {
             let arguments = arguments?;
+        println!("e3");
             let mut s = pin!(self.run(sql, arguments, 0, persistent, metadata).await?);
+        println!("e2");
 
             while let Some(v) = s.try_next().await? {
                 r#yield!(v);
