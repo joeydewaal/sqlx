@@ -5,7 +5,7 @@ use crate::message::{
 };
 use crate::{PgConnectOptions, PgConnection};
 
-use super::worker::{PipeUntil, Worker};
+use super::worker::Worker;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.11
@@ -15,10 +15,8 @@ impl PgConnection {
         // Upgrade to TLS if we were asked to and the server supports it
         let stream_bg = PgStream::connect(options).await?;
 
+        // Spawn the background worker.
         let chan = Worker::spawn(stream_bg);
-
-        // To begin a session, a frontend opens a connection to the server
-        // and sends a startup message.
 
         let mut conn = PgConnection::new(options, chan);
 
@@ -45,13 +43,12 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        let mut manager = conn.pipe_message(|message| {
-            message.write(Startup {
-                username: Some(&options.username),
-                database: options.database.as_deref(),
-                params: &params,
-            })?;
-            Ok(PipeUntil::NumResponses(1))
+        // To begin a session, a frontend opens a connection to the server
+        // and sends a startup message.
+        let mut manager = conn.pipe_once(Startup {
+            username: Some(&options.username),
+            database: options.database.as_deref(),
+            params: &params,
         })?;
 
         // The server then uses this information and the contents of
@@ -75,27 +72,19 @@ impl PgConnection {
                     Authentication::CleartextPassword => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
-
-                        manager = conn.pipe_message(|message| {
-                            message.write_msg(Password::Cleartext(
-                                options.password.as_deref().unwrap_or_default(),
-                            ))?;
-                            Ok(PipeUntil::NumResponses(1))
-                        })?;
+                        manager = conn.pipe_msg_once(Password::Cleartext(
+                            options.password.as_deref().unwrap_or_default(),
+                        ))?;
                     }
                     Authentication::Md5Password(body) => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
-                        manager = conn.pipe_message(|message| {
-                            message.write_msg(Password::Md5 {
-                                username: &options.username,
-                                password: options.password.as_deref().unwrap_or_default(),
-                                salt: body.salt,
-                            })?;
-
-                            Ok(PipeUntil::NumResponses(1))
+                        manager = conn.pipe_msg_once(Password::Md5 {
+                            username: &options.username,
+                            password: options.password.as_deref().unwrap_or_default(),
+                            salt: body.salt,
                         })?;
                     }
 

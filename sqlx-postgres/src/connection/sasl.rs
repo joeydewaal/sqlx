@@ -72,12 +72,9 @@ pub(crate) async fn authenticate<'c>(
 
     let client_first_message = format!("{GS2_HEADER}{client_first_message_bare}");
 
-    let mut manager = conn.pipe_message(|message| {
-        message.write(EncodeMessage(SaslInitialResponse {
-            response: &client_first_message,
-            plus: false,
-        }))?;
-        Ok(PipeUntil::NumResponses(1))
+    let mut manager = conn.pipe_msg_once(SaslInitialResponse {
+        response: &client_first_message,
+        plus: false,
     })?;
 
     let cont = match manager.recv_expect().await? {
