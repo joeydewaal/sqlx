@@ -606,7 +606,6 @@ async fn it_can_drop_multiple_transactions() -> anyhow::Result<()> {
 async fn pool_smoke_test() -> anyhow::Result<()> {
     use futures::{future, task::Poll, Future};
 
-    eprintln!("starting pool");
 
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
@@ -1646,11 +1645,8 @@ async fn it_can_copy_in() -> anyhow::Result<()> {
         )
         .await?;
 
-    println!("1");
     copy.send("id\n1\n2\n".as_bytes()).await?;
-    println!("1");
     let rows = copy.finish().await?;
-    println!("1");
     assert_eq!(rows, 2);
 
     // conn is safe for reuse
@@ -1658,7 +1654,6 @@ async fn it_can_copy_in() -> anyhow::Result<()> {
         .try_map(|row: PgRow| row.try_get::<i32, _>(0))
         .fetch_one(&mut conn)
         .await?;
-    println!("1");
 
     assert_eq!(2i32, value);
 
@@ -2073,12 +2068,9 @@ async fn test_pg_copy_chunked() -> anyhow::Result<()> {
 
 async fn test_copy_in_error_case(query: &str, expected_error: &str) -> anyhow::Result<()> {
     let mut conn = new::<Postgres>().await?;
-    println!("create table");
     conn.execute("CREATE TEMPORARY TABLE IF NOT EXISTS invalid_copy_target (id int4)")
         .await?;
-    println!("create table done");
     // Try the COPY operation
-    println!("start copy in");
     match conn.copy_in_raw(query).await {
         Ok(_) => anyhow::bail!("expected error"),
         Err(e) => assert!(
@@ -2086,14 +2078,11 @@ async fn test_copy_in_error_case(query: &str, expected_error: &str) -> anyhow::R
             "expected error to contain: {expected_error}, got: {e:?}"
         ),
     }
-    println!("start copy in done");
     // Verify connection is still usable
-    println!("query");
     let value = sqlx::query("select 1 + 1")
         .try_map(|row: PgRow| row.try_get::<i32, _>(0))
         .fetch_one(&mut conn)
         .await?;
-    println!("query done");
     assert_eq!(2i32, value);
 
     Ok(())
