@@ -1,12 +1,18 @@
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use sqlx_core::{io::ProtocolEncode, Error};
 
-use crate::message::{self, EncodeMessage, FrontendMessage, ReceivedMessage};
+use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage, ReceivedMessage};
 
 #[derive(Debug, PartialEq)]
 pub enum PipeUntil {
-    NumMessages { num_responses: usize },
+    NumMessages {
+        num_responses: usize,
+    },
     ReadyForQuery,
+    Either {
+        left: BackendMessageFormat,
+        right: BackendMessageFormat,
+    },
 }
 
 #[derive(Debug)]
