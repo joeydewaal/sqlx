@@ -90,7 +90,6 @@ impl Future for Worker {
                         // Not ready for receiving messages.
                         // Push front so this is the first message next time.
                         self.back_log.push_front(msg);
-                        // println!("poll ended: {:?}", start.elapsed());
                         return Poll::Pending;
                     }
                 };
@@ -122,7 +121,6 @@ impl Future for Worker {
                 }
             }
         }
-        // println!("poll ended: {:?}", start.elapsed());
         Poll::Pending
     }
 }
