@@ -123,9 +123,11 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-        if let Some(statement) = self.inner.stmt_cache.get(sql) {
+        if let Some(statement) = self.inner.stmt_cache.get(sql).await {
+            println!("got prepared {:?}", statement.0);
             return Ok(statement);
         }
+        println!("preparing");
 
         let statement = prepare(self, sql, parameters, metadata).await?;
 
