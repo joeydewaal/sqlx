@@ -86,7 +86,7 @@ pub enum FrontendMessageFormat {
     Terminate = b'X',
 }
 
-#[derive(Debug, PartialOrd, PartialEq)]
+#[derive(Debug, PartialOrd, PartialEq, Copy, Clone)]
 #[repr(u8)]
 pub enum BackendMessageFormat {
     Authentication,

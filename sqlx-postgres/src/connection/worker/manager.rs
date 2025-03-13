@@ -1,5 +1,5 @@
 use futures_channel::mpsc::UnboundedReceiver;
-use futures_util::{SinkExt as _, StreamExt};
+use futures_util::StreamExt;
 use log::Level;
 use sqlx_core::Error;
 use std::str::FromStr;
