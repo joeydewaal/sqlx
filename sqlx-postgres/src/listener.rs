@@ -115,12 +115,10 @@ impl PgListener {
     /// Starts listening for notifications on a channel.
     /// The channel name is quoted here to ensure case sensitivity.
     pub async fn listen(&mut self, channel: &str) -> Result<(), Error> {
-        println!("Listen: {channel:?}");
         self.connection()
             .await?
             .execute(&*format!(r#"LISTEN "{}""#, ident(channel)))
             .await?;
-        println!("Done");
 
         self.channels.push(channel.to_owned());
 
@@ -268,7 +266,6 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            println!("Waiting msg");
             let manager = match self.notif_buff {
                 Some(ref mut buff) => buff,
                 None => {
@@ -283,7 +280,6 @@ impl PgListener {
 
             let next_message = manager.next();
 
-            println!("Waiting new message");
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
                 // before `next_message` returns, or if the pool was already closed
@@ -291,7 +287,6 @@ impl PgListener {
             } else {
                 next_message.await
             };
-            println!("Got: {:?}", res);
 
             let message = match res {
                 Some(message) => {

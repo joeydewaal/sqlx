@@ -161,9 +161,8 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         let response = match manager.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
-                manager.recv().await?;
                 // FIXME(JoeydeWaal): Should be ReadyForQuery???
-                // conn.inner.stream.recv().await?;
+                manager.recv().await?;
                 return Err(e);
             }
         };
@@ -267,7 +266,6 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         let conn = self.conn.as_deref().expect("");
         let mut manager = conn.pipe_message(|buff| {
             buff.write_msg(CopyFail::new(msg))?;
-            // TODO: Joey
             Ok(PipeUntil::ReadyForQuery)
         })?;
 
@@ -349,7 +347,6 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
 }
 
 struct PgCopyStream<C> {
-    #[allow(unused)]
     conn: C,
     manager: Option<UnboundedReceiver<ReceivedMessage>>,
 }

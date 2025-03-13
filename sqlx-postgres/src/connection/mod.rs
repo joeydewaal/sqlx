@@ -200,20 +200,16 @@ impl Connection for PgConnection {
         // connection and terminates.
 
         Box::pin(async move {
+            // Closing the channel makes the background worker to close the connection.
             self.inner.chan.close_channel();
-            // self.inner.stream.send(Terminate).await?;
-            // self.inner.stream.shutdown().await?;
-
             Ok(())
         })
     }
 
     fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
-        self.inner.chan.close_channel();
         Box::pin(async move {
+            // Closing the channel makes the background worker to close the connection.
             self.inner.chan.close_channel();
-            // self.inner.stream.shutdown().await?;
-
             Ok(())
         })
     }
@@ -272,6 +268,7 @@ impl Connection for PgConnection {
                     // Pipe messages until we receive a `ReadyForQuery` message.
                     messages.write_sync()
                 } else {
+                    // This sends an empty message that waits for 0 responses.
                     Ok(PipeUntil::NumResponses(0))
                 }
             })?;
@@ -285,11 +282,12 @@ impl Connection for PgConnection {
     }
 
     fn shrink_buffers(&mut self) {
-        // self.inner.stream.shrink_buffers();
+        // No-op
     }
 
     #[doc(hidden)]
     fn flush(&mut self) -> BoxFuture<'_, Result<(), Error>> {
+        // No-op
         Box::pin(async { Ok(()) })
     }
 

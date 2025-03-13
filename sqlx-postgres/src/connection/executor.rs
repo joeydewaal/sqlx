@@ -422,6 +422,7 @@ impl<'c> Executor<'c> for &'c PgConnection {
     }
 }
 
+// We keep the Executor impl for &mut PgConnection here backwards compatibility.
 impl<'c> Executor<'c> for &'c mut PgConnection {
     type Database = Postgres;
 
