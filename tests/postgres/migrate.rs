@@ -68,7 +68,7 @@ async fn reversible(mut conn: PoolConnection<Postgres>) -> anyhow::Result<()> {
 
 #[sqlx::test(migrations = false)]
 async fn no_tx(mut conn: PoolConnection<Postgres>) -> anyhow::Result<()> {
-    assert!(1 == 2);
+    // assert!(1 == 2);
     println!("here");
     clean_up(&mut conn).await?;
     let migrator = Migrator::new(Path::new("tests/postgres/migrations_no_tx")).await?;

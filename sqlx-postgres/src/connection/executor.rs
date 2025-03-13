@@ -124,10 +124,8 @@ impl PgConnection {
         metadata: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
         if let Some(statement) = self.inner.stmt_cache.get(sql).await {
-            println!("got prepared {:?}", statement.0);
             return Ok(statement);
         }
-        println!("preparing");
 
         let statement = match prepare(self, sql, parameters, metadata).await {
             Ok(s) => s,
@@ -245,9 +243,7 @@ impl PgConnection {
 
         Ok(try_stream! {
             loop {
-                println!("rECV");
                 let message = manager.recv().await?;
-                println!("rECV");
 
                 match message.format {
                     BackendMessageFormat::BindComplete
@@ -343,7 +339,6 @@ impl<'c> Executor<'c> for &'c PgConnection {
         'q: 'e,
         E: 'q,
     {
-        println!("e1");
         let sql = query.sql();
         // False positive: https://github.com/rust-lang/rust-clippy/issues/12560
         #[allow(clippy::map_clone)]
@@ -353,9 +348,7 @@ impl<'c> Executor<'c> for &'c PgConnection {
 
         Box::pin(try_stream! {
             let arguments = arguments?;
-        println!("e3");
             let mut s = pin!(self.run(sql, arguments, 0, persistent, metadata).await?);
-        println!("e2");
 
             while let Some(v) = s.try_next().await? {
                 r#yield!(v);
