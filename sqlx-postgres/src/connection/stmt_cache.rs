@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::{
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
 
 use sqlx_core::{common::StatementCache, rt::ManualResetEvent};
 
@@ -27,7 +30,19 @@ impl SharedStatementCache {
     }
 
     pub fn lock<'c>(&'c self) -> MutexGuard<'c, StatementCache<StatementStatus>> {
+        println!("LOCK");
         self.inner.lock().expect("ERROR")
+    }
+
+    pub fn remove_notify(&self, stmt: &str) {
+        let mut this = self.lock();
+        match this.get_mut(stmt) {
+            Some(StatementStatus::InFlight { semaphore }) => {
+                semaphore.set();
+                let _ = this.remove(stmt);
+            }
+            _ => {}
+        }
     }
 
     pub async fn get(&self, stmt: &str) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
@@ -62,7 +77,10 @@ impl SharedStatementCache {
 
             if let Some(sem) = opt_semaphore {
                 println!("Waiting for inflight");
-                sem.wait().await
+                let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.wait()).await;
+                if result.is_err() {
+                    println!("Prop panicek");
+                }
             }
         }
         None

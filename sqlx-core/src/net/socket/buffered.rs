@@ -122,11 +122,13 @@ impl<S: Socket> BufferedSocket<S> {
         F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
     {
         loop {
+            println!("TRY_READ");
             let read_len = match try_read(&mut self.read_buf.read)? {
                 ControlFlow::Continue(read_len) => read_len,
                 ControlFlow::Break(ret) => return Poll::Ready(Ok(ret)),
             };
 
+            println!("TRY_READ_");
             ready!(self.read_buf.poll_read(cx, read_len, &mut self.socket))?;
         }
     }
@@ -330,6 +332,7 @@ impl ReadBuffer {
             self.reserve(len - self.read.len());
 
             let read = ready!(socket.poll_read(cx, &mut self.available))?;
+            println!("TRY_READ_2");
 
             if read == 0 {
                 return Poll::Ready(Err(io::Error::new(
