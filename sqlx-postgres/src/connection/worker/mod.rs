@@ -54,12 +54,10 @@ impl Future for Worker {
     type Output = sqlx_core::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        println!("POLL");
         // Push as many new messages in the write buffer.
         // let start = Instant::now();
         while let Poll::Ready(Some(mut msg)) = self.chan.poll_next_unpin(cx) {
             msg.id = self.ids;
-            // println!("{:?}", msg.data);
             self.ids += 1;
             self.should_flush = true;
             let write_buff = self.conn.write_buffer_mut();
@@ -83,7 +81,6 @@ impl Future for Worker {
         }
         while let Some(mut msg) = self.back_log.pop_front() {
             loop {
-                println!("POLLL_NEXT");
                 let response = match poll_next_message(&mut self.conn, cx) {
                     Poll::Ready(response) => response?,
                     Poll::Pending => {
@@ -93,15 +90,11 @@ impl Future for Worker {
                         return Poll::Pending;
                     }
                 };
-                println!("POLLL_NEXT_DONE");
 
-                println!("BG: {:?}", response.format);
 
                 let format = response.format;
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
-                println!("SENDING");
                 let _ = msg.chan.unbounded_send(response).is_err();
-                println!("SENDING DONE");
 
                 match &mut msg.send_until {
                     PipeUntil::ReadyForQuery => {

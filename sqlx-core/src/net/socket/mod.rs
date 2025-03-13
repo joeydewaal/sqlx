@@ -47,9 +47,7 @@ pub trait Socket: Send + Sync + Unpin + 'static {
             match self.try_read(buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
 
-                    println!("WOULD BLOCK");
                     ready!(self.poll_read_ready(cx))?;
-                    println!("WOULD BLOCK 2");
                 }
                 ready => return Poll::Ready(ready),
             }

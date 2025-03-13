@@ -30,7 +30,6 @@ impl SharedStatementCache {
     }
 
     pub fn lock<'c>(&'c self) -> MutexGuard<'c, StatementCache<StatementStatus>> {
-        println!("LOCK");
         self.inner.lock().expect("ERROR")
     }
 
@@ -59,12 +58,10 @@ impl SharedStatementCache {
                             statement_id,
                             metadata,
                         } => {
-                            println!("Got cached");
                             return Some((statement_id, metadata));
                         }
                     }
                 } else {
-                    println!("Not cached");
                     this.insert(
                         stmt,
                         StatementStatus::InFlight {
@@ -76,10 +73,8 @@ impl SharedStatementCache {
             };
 
             if let Some(sem) = opt_semaphore {
-                println!("Waiting for inflight");
                 let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.wait()).await;
                 if result.is_err() {
-                    println!("Prop panicek");
                 }
             }
         }
@@ -111,7 +106,6 @@ impl SharedStatementCache {
                         metadata,
                     } => return Some((statement_id, metadata)),
                     StatementStatus::InFlight { semaphore } => {
-                        println!("Inserting, notifying");
                         semaphore.set();
                         return None;
                     }
