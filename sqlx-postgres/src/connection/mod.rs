@@ -7,7 +7,7 @@ use std::sync::RwLock;
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
 use sqlx_core::io::ProtocolEncode;
-use stmt_cache::SharedStatementCache;
+use stmt_cache::{SharedStatementCache, StatementStatus};
 use type_cache::TypeCache;
 use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 
@@ -258,8 +258,12 @@ impl Connection for PgConnection {
 
             let mut manager = self.pipe_message(|messages| {
                 let mut stmt_cache = self.inner.stmt_cache.lock();
-                while let Some((id, _)) = stmt_cache.remove_lru() {
-                    messages.write_msg(Close::Statement(id))?;
+                while let Some(StatementStatus::Cached {
+                    statement_id,
+                    metadata: _,
+                }) = stmt_cache.remove_lru()
+                {
+                    messages.write_msg(Close::Statement(statement_id))?;
                     cleared += 1;
                 }
                 drop(stmt_cache);
