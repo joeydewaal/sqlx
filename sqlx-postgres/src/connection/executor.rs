@@ -6,7 +6,7 @@ use crate::io::{PortalId, StatementId};
 use crate::logger::QueryLogger;
 use crate::message::{
     self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, ParameterDescription, Parse,
-    ParseComplete, Query, RowDescription, Sync,
+    ParseComplete, Query, RowDescription,
 };
 use crate::statement::PgStatementMetadata;
 use crate::{
@@ -53,8 +53,7 @@ async fn prepare(
         }
 
         // we ask for the server to immediately send us the result of the PARSE command
-        message.write_msg(Sync {})?;
-        Ok(PipeUntil::ReadyForQuery)
+        message.write_sync()
     })?;
 
     // indicates that the SQL query string is now successfully parsed and has semantic validity
@@ -77,9 +76,6 @@ async fn prepare(
         let parameters = conn.handle_parameter_description(parameters).await?;
 
         let (columns, column_names) = conn.handle_row_description(rows, true).await?;
-
-        // ensure that if we did fetch custom data, we wait until we are fully ready before
-        // continueing
 
         Arc::new(PgStatementMetadata {
             parameters,
@@ -137,8 +133,7 @@ impl PgConnection {
             if let Some((id, _)) = self.inner.stmt_cache.checked_insert(sql, statement.clone()) {
                 let mut manager = self.pipe_message(|message| {
                     message.write_msg(Close::Statement(id))?;
-                    message.write_msg(Sync {})?;
-                    Ok(PipeUntil::ReadyForQuery)
+                    message.write_sync()
                 })?;
                 manager.wait_for_close_complete(1).await?;
                 manager.recv_ready_for_query().await?;
@@ -156,9 +151,6 @@ impl PgConnection {
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
-
-        // before we continue, wait until we are "ready" to accept more queries
-        // self.wait_until_ready().await?;
 
         let mut metadata: Arc<PgStatementMetadata>;
 
@@ -186,9 +178,6 @@ impl PgConnection {
 
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
-
-            // consume messages till `ReadyForQuery` before bind and execute
-            // self.wait_until_ready().await?;
 
             let manager = self.pipe_message(|messages| {
                 // bind to attach the arguments to the statement and create a portal
@@ -224,8 +213,7 @@ impl PgConnection {
                 // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
                 // is still serial but it would reduce round-trips. Some kind of builder pattern that is
                 // termed batching might suit this.
-                messages.write_msg(Sync {})?;
-                Ok(PipeUntil::ReadyForQuery)
+                messages.write_sync()
             })?;
 
             // prepared statements are binary

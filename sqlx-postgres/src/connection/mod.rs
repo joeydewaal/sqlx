@@ -6,13 +6,16 @@ use std::sync::RwLock;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
+use sqlx_core::io::ProtocolEncode;
 use stmt_cache::SharedStatementCache;
 use type_cache::TypeCache;
 use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
-use crate::message::{Close, Notification, Query, TransactionStatus};
+use crate::message::{
+    Close, EncodeMessage, FrontendMessage, Notification, Query, TransactionStatus,
+};
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
 use crate::{PgConnectOptions, Postgres};
@@ -119,6 +122,23 @@ impl PgConnection {
         self.inner.transaction_depth.fetch_sub(1, Ordering::Relaxed);
     }
 
+    fn pipe_msg_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
+    where
+        T: FrontendMessage,
+    {
+        self.pipe_once(EncodeMessage(value))
+    }
+
+    fn pipe_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
+    where
+        T: ProtocolEncode<'en, ()>,
+    {
+        self.pipe_message(|buff| {
+            buff.write(value)?;
+            Ok(PipeUntil::NumResponses(1))
+        })
+    }
+
     pub fn pipe_message<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
     where
         F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
@@ -173,14 +193,14 @@ impl Connection for PgConnection {
     type Options = PgConnectOptions;
 
     fn close(self) -> BoxFuture<'static, Result<(), Error>> {
-        println!("Closing");
         // The normal, graceful termination procedure is that the frontend sends a Terminate
         // message and immediately closes the connection.
 
         // On receipt of this message, the backend closes the
         // connection and terminates.
-        self.inner.chan.close_channel();
+
         Box::pin(async move {
+            self.inner.chan.close_channel();
             // self.inner.stream.send(Terminate).await?;
             // self.inner.stream.shutdown().await?;
 
@@ -191,6 +211,7 @@ impl Connection for PgConnection {
     fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
         self.inner.chan.close_channel();
         Box::pin(async move {
+            self.inner.chan.close_channel();
             // self.inner.stream.shutdown().await?;
 
             Ok(())
@@ -205,8 +226,7 @@ impl Connection for PgConnection {
         Box::pin(async move {
             let mut manager = self.pipe_message(|message| {
                 // The simplest call-and-response that's possible.
-                message.write_sync();
-                Ok(PipeUntil::ReadyForQuery)
+                message.write_sync()
             })?;
             manager.recv_ready_for_query().await?;
             Ok(())
@@ -249,11 +269,11 @@ impl Connection for PgConnection {
                 drop(stmt_cache);
 
                 if cleared > 0 {
-                    messages.write_sync();
-                    return Ok(PipeUntil::ReadyForQuery);
+                    // Pipe messages until we receive a `ReadyForQuery` message.
+                    messages.write_sync()
+                } else {
+                    Ok(PipeUntil::NumResponses(0))
                 }
-
-                Ok(PipeUntil::NumResponses(0))
             })?;
 
             if cleared > 0 {

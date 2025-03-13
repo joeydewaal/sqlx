@@ -3,6 +3,7 @@ use sqlx_core::{io::ProtocolEncode, Error};
 
 use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage, ReceivedMessage};
 
+//
 #[derive(Debug, PartialEq)]
 pub enum PipeUntil {
     NumResponses(usize),
@@ -33,16 +34,12 @@ impl IoRequest {
 }
 
 pub struct MessageBuf {
-    num_messages: usize,
     data: Vec<u8>,
 }
 
 impl MessageBuf {
     pub fn new() -> Self {
-        Self {
-            num_messages: 0,
-            data: Vec::new(),
-        }
+        Self { data: Vec::new() }
     }
     #[inline(always)]
     pub fn write<'en, T>(&mut self, value: T) -> sqlx_core::Result<()>
@@ -57,33 +54,32 @@ impl MessageBuf {
     where
         T: ProtocolEncode<'en, C>,
     {
-        value.encode_with(&mut self.data, context)?;
-        self.inc_response_count();
-        Ok(())
+        value.encode_with(&mut self.data, context)
     }
 
-    pub fn write_sync(&mut self) {
+    /// Writes a [Sync] message in the buffe and returns a `PipeUntil::ReadyForQuery` for
+    /// convenience.
+    #[inline(always)]
+    pub fn write_sync(&mut self) -> sqlx_core::Result<PipeUntil> {
         self.write_msg(message::Sync)
             .expect("BUG: Sync should not be too big for protocol");
+        Ok(PipeUntil::ReadyForQuery)
     }
 
-    pub fn inc_response_count(&mut self) {
-        self.num_messages += 1;
-    }
     #[inline(always)]
     pub(crate) fn write_msg(&mut self, message: impl FrontendMessage) -> Result<(), Error> {
         self.write(EncodeMessage(message))
     }
 
     pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
-        let (tx, rx) = unbounded();
+        let (chan, receiver) = unbounded();
         let req = IoRequest {
             id: 0,
             ends_at,
             data: self.data,
-            chan: tx,
+            chan,
         };
 
-        (req, rx)
+        (req, receiver)
     }
 }
