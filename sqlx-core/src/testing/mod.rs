@@ -109,14 +109,11 @@ where
     type Output = Fut::Output;
 
     fn run_test(self, args: TestArgs) -> Self::Output {
-        println!("Before");
         run_test_with_pool(args, |pool| async move {
-            println!("Here2");
             let conn = pool
                 .acquire()
                 .await
                 .expect("failed to acquire test pool connection");
-            println!("Here1");
             let res = (self)(conn).await;
             pool.close().await;
             res
@@ -195,7 +192,6 @@ where
 {
     let test_path = args.test_path;
     run_test::<DB, _, _>(args, |pool_opts, connect_opts| async move {
-        println!("Here3");
         let pool = pool_opts
             .connect_with(connect_opts)
             .await
@@ -225,15 +221,12 @@ where
     Fut::Output: TestTermination,
 {
     crate::rt::test_block_on(async move {
-        println!("Here4");
         let test_context = DB::test_context(&args)
             .await
             .expect("failed to connect to setup test database");
 
-    println!("Here8");
         setup_test_db::<DB>(&test_context.connect_opts, &args).await;
 
-        println!("Here5");
         let res = test_fn(test_context.pool_opts, test_context.connect_opts).await;
 
         if res.is_success() {
@@ -256,20 +249,17 @@ async fn setup_test_db<DB: Database>(
     DB::Connection: Migrate + Sized,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
 {
-    println!("Here8");
     let mut conn = copts
         .connect()
         .await
         .expect("failed to connect to test database");
 
     if let Some(migrator) = args.migrator {
-        println!("Here6");
         migrator
             .run_direct(&mut conn)
             .await
             .expect("failed to apply migrations");
     }
-    println!("Here6");
 
     for fixture in args.fixtures {
         (&mut conn)
