@@ -14,6 +14,8 @@ pub mod rt_tokio;
 #[error("operation timed out")]
 pub struct TimeoutError(());
 
+pub use futures_intrusive::sync::ManualResetEvent;
+
 pub enum JoinHandle<T> {
     #[cfg(feature = "_rt-async-std")]
     AsyncStd(async_std::task::JoinHandle<T>),

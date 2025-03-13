@@ -79,17 +79,6 @@ impl Future for Worker {
             }
         }
         while let Some(mut msg) = self.back_log.pop_front() {
-            match msg.chan.poll_ready(cx) {
-                Poll::Pending => {
-                    // Not ready for send messages.
-                    // Push front so this is the first message next time.
-                    self.back_log.push_front(msg);
-                    return Poll::Pending;
-                }
-                Poll::Ready(_) => {
-                    // Channel is ready to receive messages
-                }
-            }
             loop {
                 let response = match poll_next_message(&mut self.conn, cx) {
                     Poll::Ready(response) => response?,
@@ -103,7 +92,7 @@ impl Future for Worker {
 
                 let format = response.format;
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
-                let _ = msg.chan.start_send(response).is_err();
+                let _ = msg.chan.unbounded_send(response).is_err();
 
                 match &mut msg.send_until {
                     PipeUntil::ReadyForQuery => {
