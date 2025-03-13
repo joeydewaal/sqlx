@@ -77,7 +77,7 @@ pub(crate) async fn authenticate<'c>(
             response: &client_first_message,
             plus: false,
         }))?;
-        Ok(PipeUntil::NumMessages { num_responses: 1 })
+        Ok(PipeUntil::NumResponses(1))
     })?;
 
     let cont = match manager.recv_expect().await? {

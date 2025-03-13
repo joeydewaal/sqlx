@@ -204,15 +204,13 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
-        println!("start send");
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
             let conn = self.conn.as_deref().expect("");
             conn.pipe_message(|buff| {
                 buff.write_msg(CopyData(chunk))?;
-                Ok(PipeUntil::NumMessages { num_responses: 0 })
+                Ok(PipeUntil::NumResponses(0))
             })?;
         }
-        println!("end send");
 
         Ok(self)
     }
@@ -296,13 +294,11 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(self) -> Result<u64> {
-        println!("start finish");
         let conn = self.conn.as_deref().expect("");
         let mut manager = conn.pipe_message(|buff| {
             buff.write_msg(CopyDone)?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
-        println!("start 1");
 
         let cc: CommandComplete = match manager.recv_expect().await {
             Ok(cc) => cc,
@@ -312,7 +308,6 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 return Err(e);
             }
         };
-        println!("start 2");
 
         manager.recv_expect::<ReadyForQuery>().await?;
 
@@ -328,7 +323,7 @@ impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
                     buff.write_msg(CopyFail::new(
                         "PgCopyIn dropped without calling finish() or fail()",
                     ))?;
-                    Ok(PipeUntil::NumMessages { num_responses: 0 })
+                    Ok(PipeUntil::NumResponses(0))
                 })
                 .expect("BUG: PgCopyIn abort message should not be too large");
         }

@@ -5,9 +5,7 @@ use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage,
 
 #[derive(Debug, PartialEq)]
 pub enum PipeUntil {
-    NumMessages {
-        num_responses: usize,
-    },
+    NumResponses(usize),
     ReadyForQuery,
     Either {
         left: BackendMessageFormat,
@@ -26,7 +24,7 @@ pub struct IoRequest {
 impl IoRequest {
     pub fn decrease_num_request(&mut self) {
         match &mut self.ends_at {
-            PipeUntil::NumMessages { num_responses } => {
+            PipeUntil::NumResponses(num_responses) => {
                 *num_responses -= 1;
             }
             _ => {}

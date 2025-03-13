@@ -275,7 +275,7 @@ impl PgListener {
                     let manager = self
                         .connection()
                         .await?
-                        .pipe_message(|_| Ok(PipeUntil::NumMessages { num_responses: 1 }))?;
+                        .pipe_message(|_| Ok(PipeUntil::NumResponses(1)))?;
                     self.notif_buff = Some(manager.into_inner().1);
                     self.notif_buff.as_mut().unwrap()
                 }

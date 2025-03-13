@@ -8,7 +8,7 @@ use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
 use stmt_cache::SharedStatementCache;
 use type_cache::TypeCache;
-use worker::{ConnManager, MessageBuf, PipeUntil, WorkerConn};
+use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 
 use crate::error::Error;
 use crate::io::{StatementId, StatementIdManager};
@@ -40,7 +40,7 @@ pub struct PgConnection {
 
 pub struct PgConnectionInner {
     // Channel to the background worker
-    pub(crate) chan: WorkerConn,
+    pub(crate) chan: UnboundedSender<IoRequest>,
 
     // underlying TCP or UDS stream,
     // wrapped in a potentially TLS stream,
@@ -128,9 +128,8 @@ impl PgConnection {
         let (request, receiver) = buffer.finish(wait_type);
         self.inner
             .chan
-            .chan
             .unbounded_send(request)
-            .map_err(|_| Error::WorkerCrashed)?;
+            .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
 
         Ok(ConnManager::new(receiver, &self))
     }
@@ -139,6 +138,25 @@ impl PgConnection {
         match self.inner.transaction_status {
             TransactionStatus::Transaction => true,
             TransactionStatus::Error | TransactionStatus::Idle => false,
+        }
+    }
+
+    fn new(options: &PgConnectOptions, chan: UnboundedSender<IoRequest>) -> Self {
+        Self {
+            inner: Box::new(PgConnectionInner {
+                chan,
+                notifications: None,
+                parameter_statuses: BTreeMap::new().into(),
+                server_version_num: AtomicU32::new(0),
+                process_id: 0,
+                secret_key: 0,
+                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
+                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
+                type_cache: TypeCache::new(),
+                transaction_status: TransactionStatus::Idle,
+                transaction_depth: AtomicUsize::new(0),
+                log_settings: options.log_settings.clone(),
+            }),
         }
     }
 }
@@ -161,7 +179,7 @@ impl Connection for PgConnection {
 
         // On receipt of this message, the backend closes the
         // connection and terminates.
-        self.inner.chan.close();
+        self.inner.chan.close_channel();
         Box::pin(async move {
             // self.inner.stream.send(Terminate).await?;
             // self.inner.stream.shutdown().await?;
@@ -171,7 +189,7 @@ impl Connection for PgConnection {
     }
 
     fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
-        self.inner.chan.close();
+        self.inner.chan.close_channel();
         Box::pin(async move {
             // self.inner.stream.shutdown().await?;
 
@@ -235,7 +253,7 @@ impl Connection for PgConnection {
                     return Ok(PipeUntil::ReadyForQuery);
                 }
 
-                Ok(PipeUntil::NumMessages { num_responses: 0 })
+                Ok(PipeUntil::NumResponses(0))
             })?;
 
             if cleared > 0 {

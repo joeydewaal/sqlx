@@ -7,7 +7,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures_channel::mpsc::{unbounded, UnboundedReceiver};
+use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
 use sqlx_core::{
     bytes::Buf as _,
@@ -19,11 +19,9 @@ use crate::message::{BackendMessageFormat, ReceivedMessage};
 
 use super::PgStream;
 
-mod channel;
 mod manager;
 mod message;
 
-pub use channel::WorkerConn;
 pub use manager::ConnManager;
 pub use message::{IoRequest, MessageBuf, PipeUntil};
 
@@ -37,7 +35,7 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub fn spawn(stream: PgStream) -> WorkerConn {
+    pub fn spawn(stream: PgStream) -> UnboundedSender<IoRequest> {
         let (tx, rx) = unbounded();
 
         let conn = Worker {
@@ -50,7 +48,7 @@ impl Worker {
         };
 
         spawn(conn);
-        WorkerConn::new(tx)
+        tx
     }
 }
 
@@ -72,7 +70,7 @@ impl Future for Worker {
             write_buff.bytes_written += msg.data.len();
             write_buff.sanity_check();
 
-            if !matches!(msg.ends_at, PipeUntil::NumMessages { num_responses: 0 }) {
+            if !matches!(msg.ends_at, PipeUntil::NumResponses(0)) {
                 self.back_log.push_back(msg);
             }
         }
@@ -111,7 +109,7 @@ impl Future for Worker {
                             break;
                         }
                     }
-                    PipeUntil::NumMessages { num_responses } => {
+                    PipeUntil::NumResponses(num_responses) => {
                         if num_responses == 0 {
                             break;
                         }
