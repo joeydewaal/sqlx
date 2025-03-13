@@ -38,6 +38,10 @@ impl<T> StatementCache<T> {
         lru_item
     }
 
+    pub fn remove(&mut self, k: &str) -> Option<T> {
+        self.inner.remove(k)
+    }
+
     /// The number of statements in the cache.
     pub fn len(&self) -> usize {
         self.inner.len()

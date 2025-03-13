@@ -93,6 +93,7 @@ impl TestSupport for Postgres {
 }
 
 async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
+    println!("Here9");
     let url = dotenvy::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let master_opts = PgConnectOptions::from_str(&url).expect("failed to parse DATABASE_URL");
@@ -126,7 +127,9 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
         }
     };
 
+    println!("Here12");
     let mut conn = master_pool.acquire().await?;
+    println!("Here11");
 
     // language=PostgreSQL
     conn.execute(
@@ -154,8 +157,10 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
     )
     .await?;
 
+    println!("Here13");
     let db_name = Postgres::db_name(args);
     do_cleanup(&mut conn, &db_name).await?;
+    println!("Here10");
 
     query(
         r#"
@@ -191,11 +196,14 @@ async fn test_context(args: &TestArgs) -> Result<TestContext<Postgres>, Error> {
 
 async fn do_cleanup(conn: &mut PgConnection, db_name: &str) -> Result<(), Error> {
     let delete_db_command = format!("drop database if exists {db_name:?};");
+    println!("Here15");
     conn.execute(&*delete_db_command).await?;
+    println!("Here16");
     query("delete from _sqlx_test.databases where db_name = $1::text")
         .bind(db_name)
         .execute(&mut *conn)
         .await?;
+    println!("Here17");
 
     Ok(())
 }
