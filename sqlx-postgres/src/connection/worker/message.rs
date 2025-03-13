@@ -3,34 +3,29 @@ use sqlx_core::{io::ProtocolEncode, Error};
 
 use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage, ReceivedMessage};
 
-//
+/// Pipes responses from the background worker until one of the variants.
 #[derive(Debug, PartialEq)]
 pub enum PipeUntil {
+    /// Waits until the worker got n number of messages. In general this should only be used if the
+    /// number of responses is 0. There could be any types of request be sent asynchronously, like
+    /// [NotificationResponse], [ParameterStatus] or [NoticeResponse].
     NumResponses(usize),
+    /// Waits until the worker received a [ReadyForQuery] response.
     ReadyForQuery,
+    /// Waits until the worker received one of these responses.
     Either {
         left: BackendMessageFormat,
         right: BackendMessageFormat,
     },
 }
 
+/// A request for the background worker.
 #[derive(Debug)]
 pub struct IoRequest {
     pub chan: UnboundedSender<ReceivedMessage>,
     pub data: Vec<u8>,
-    pub ends_at: PipeUntil,
+    pub send_until: PipeUntil,
     pub id: usize,
-}
-
-impl IoRequest {
-    pub fn decrease_num_request(&mut self) {
-        match &mut self.ends_at {
-            PipeUntil::NumResponses(num_responses) => {
-                *num_responses -= 1;
-            }
-            _ => {}
-        }
-    }
 }
 
 pub struct MessageBuf {
@@ -75,7 +70,7 @@ impl MessageBuf {
         let (chan, receiver) = unbounded();
         let req = IoRequest {
             id: 0,
-            ends_at,
+            send_until: ends_at,
             data: self.data,
             chan,
         };
