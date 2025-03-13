@@ -27,7 +27,6 @@ pub use message::{IoRequest, MessageBuf, PipeUntil};
 
 pub struct Worker {
     ids: usize,
-    messages_between_flush: usize,
     should_flush: bool,
     chan: UnboundedReceiver<IoRequest>,
     back_log: VecDeque<IoRequest>,
@@ -40,7 +39,6 @@ impl Worker {
 
         let conn = Worker {
             ids: 0,
-            messages_between_flush: 0,
             should_flush: false,
             chan: rx,
             back_log: VecDeque::new(),
@@ -61,7 +59,6 @@ impl Future for Worker {
         while let Poll::Ready(Some(mut msg)) = self.chan.poll_next_unpin(cx) {
             msg.id = self.ids;
             self.ids += 1;
-            self.messages_between_flush += 1;
             self.should_flush = true;
             let write_buff = self.conn.write_buffer_mut();
             let buff = write_buff.buf_mut();
@@ -70,7 +67,7 @@ impl Future for Worker {
             write_buff.bytes_written += msg.data.len();
             write_buff.sanity_check();
 
-            if !matches!(msg.ends_at, PipeUntil::NumResponses(0)) {
+            if !matches!(msg.send_until, PipeUntil::NumResponses(0)) {
                 self.back_log.push_back(msg);
             }
         }
@@ -79,10 +76,20 @@ impl Future for Worker {
         if self.should_flush {
             if let Poll::Ready(_) = self.conn.poll_flush(cx) {
                 self.should_flush = false;
-                self.messages_between_flush = 0;
             }
         }
         while let Some(mut msg) = self.back_log.pop_front() {
+            match msg.chan.poll_ready(cx) {
+                Poll::Pending => {
+                    // Not ready for send messages.
+                    // Push front so this is the first message next time.
+                    self.back_log.push_front(msg);
+                    return Poll::Pending;
+                }
+                Poll::Ready(_) => {
+                    // Channel is ready to receive messages
+                }
+            }
             loop {
                 let response = match poll_next_message(&mut self.conn, cx) {
                     Poll::Ready(response) => response?,
@@ -93,28 +100,25 @@ impl Future for Worker {
                         return Poll::Pending;
                     }
                 };
-                msg.decrease_num_request();
-                println!("BG got: {:?} {:?}", response.format, msg.id);
+
                 let format = response.format;
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
-                let is_closed = msg.chan.unbounded_send(response).is_err();
-                if is_closed {
-                    println!("Skipping: {:?} {:?}", format, msg.id);
-                }
+                let _ = msg.chan.start_send(response).is_err();
 
-                match msg.ends_at {
+                match &mut msg.send_until {
                     PipeUntil::ReadyForQuery => {
                         if is_rfq {
                             break;
                         }
                     }
                     PipeUntil::NumResponses(num_responses) => {
-                        if num_responses == 0 {
+                        *num_responses -= 1;
+                        if *num_responses == 0 {
                             break;
                         }
                     }
                     PipeUntil::Either { left, right } => {
-                        if format == left || format == right {
+                        if format == *left || format == *right {
                             break;
                         }
                     }
