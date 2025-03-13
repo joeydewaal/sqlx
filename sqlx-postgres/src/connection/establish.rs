@@ -1,19 +1,11 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicUsize};
-
-use crate::connection::stmt_cache::SharedStatementCache;
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
-use crate::io::{StatementId, StatementIdManager};
 use crate::message::{
     Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
-    TransactionStatus,
 };
 use crate::{PgConnectOptions, PgConnection};
 
-use super::type_cache::TypeCache;
 use super::worker::{PipeUntil, Worker};
-use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.11
@@ -27,22 +19,8 @@ impl PgConnection {
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
-        let mut conn = PgConnection {
-            inner: Box::new(PgConnectionInner {
-                chan,
-                parameter_statuses: BTreeMap::new().into(),
-                notifications: None,
-                server_version_num: AtomicU32::new(0),
-                process_id: 0,
-                secret_key: 0,
-                transaction_status: TransactionStatus::Idle,
-                transaction_depth: AtomicUsize::new(0),
-                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
-                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
-                type_cache: TypeCache::new(),
-                log_settings: options.log_settings.clone(),
-            }),
-        };
+
+        let mut conn = PgConnection::new(options, chan);
 
         let mut params = vec![
             // Sets the display format for date and time values,
@@ -73,7 +51,7 @@ impl PgConnection {
                 database: options.database.as_deref(),
                 params: &params,
             })?;
-            Ok(PipeUntil::NumMessages { num_responses: 1 })
+            Ok(PipeUntil::NumResponses(1))
         })?;
 
         // The server then uses this information and the contents of
@@ -102,7 +80,7 @@ impl PgConnection {
                             message.write_msg(Password::Cleartext(
                                 options.password.as_deref().unwrap_or_default(),
                             ))?;
-                            Ok(PipeUntil::NumMessages { num_responses: 1 })
+                            Ok(PipeUntil::NumResponses(1))
                         })?;
                     }
                     Authentication::Md5Password(body) => {
@@ -117,7 +95,7 @@ impl PgConnection {
                                 salt: body.salt,
                             })?;
 
-                            Ok(PipeUntil::NumMessages { num_responses: 1 })
+                            Ok(PipeUntil::NumResponses(1))
                         })?;
                     }
 
