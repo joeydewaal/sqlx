@@ -152,12 +152,16 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         let mut manager = conn.pipe_message(|buff| {
             buff.write_msg(Query(statement))?;
             // FIXME
-            Ok(PipeUntil::ReadyForQuery)
+            Ok(PipeUntil::Either {
+                left: BackendMessageFormat::CopyInResponse,
+                right: BackendMessageFormat::ReadyForQuery,
+            })
         })?;
 
         let response = match manager.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
+                manager.recv().await?;
                 // FIXME(JoeydeWaal): Should be ReadyForQuery???
                 // conn.inner.stream.recv().await?;
                 return Err(e);
@@ -200,6 +204,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
+        println!("start send");
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
             let conn = self.conn.as_deref().expect("");
             conn.pipe_message(|buff| {
@@ -207,6 +212,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 Ok(PipeUntil::NumMessages { num_responses: 0 })
             })?;
         }
+        println!("end send");
 
         Ok(self)
     }
@@ -290,11 +296,13 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(self) -> Result<u64> {
+        println!("start finish");
         let conn = self.conn.as_deref().expect("");
         let mut manager = conn.pipe_message(|buff| {
             buff.write_msg(CopyDone)?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
+        println!("start 1");
 
         let cc: CommandComplete = match manager.recv_expect().await {
             Ok(cc) => cc,
@@ -304,6 +312,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 return Err(e);
             }
         };
+        println!("start 2");
 
         manager.recv_expect::<ReadyForQuery>().await?;
 

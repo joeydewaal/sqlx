@@ -97,9 +97,14 @@ impl Future for Worker {
                     }
                 };
                 msg.decrease_num_request();
-
+                println!("BG got: {:?} {:?}", response.format, msg.id);
+                let format = response.format;
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
-                let _ = msg.chan.unbounded_send(response);
+                let is_closed = msg.chan.unbounded_send(response).is_err();
+                if is_closed {
+                    println!("Skipping: {:?} {:?}", format, msg.id);
+                }
+
                 match msg.ends_at {
                     PipeUntil::ReadyForQuery => {
                         if is_rfq {
@@ -108,6 +113,11 @@ impl Future for Worker {
                     }
                     PipeUntil::NumMessages { num_responses } => {
                         if num_responses == 0 {
+                            break;
+                        }
+                    }
+                    PipeUntil::Either { left, right } => {
+                        if format == left || format == right {
                             break;
                         }
                     }

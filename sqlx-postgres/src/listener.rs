@@ -1,8 +1,7 @@
 use std::fmt::{self, Debug};
-use std::io;
 use std::str::from_utf8;
 
-use futures_channel::mpsc;
+use futures_channel::mpsc::{self, UnboundedReceiver};
 use futures_core::future::BoxFuture;
 use futures_core::stream::{BoxStream, Stream};
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -14,7 +13,7 @@ use tracing::Instrument;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
-use crate::message::{BackendMessageFormat, Notification};
+use crate::message::{BackendMessageFormat, Notification, ReceivedMessage};
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
 use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, PipeUntil, Postgres};
@@ -28,6 +27,7 @@ use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, PipeUnt
 pub struct PgListener {
     pool: Pool<Postgres>,
     connection: Option<PoolConnection<Postgres>>,
+    notif_buff: Option<UnboundedReceiver<ReceivedMessage>>,
     buffer_rx: mpsc::UnboundedReceiver<Notification>,
     buffer_tx: Option<mpsc::UnboundedSender<Notification>>,
     channels: Vec<String>,
@@ -66,6 +66,7 @@ impl PgListener {
 
         Ok(Self {
             pool: pool.clone(),
+            notif_buff: None,
             connection: Some(connection),
             buffer_rx: receiver,
             buffer_tx: None,
@@ -114,10 +115,12 @@ impl PgListener {
     /// Starts listening for notifications on a channel.
     /// The channel name is quoted here to ensure case sensitivity.
     pub async fn listen(&mut self, channel: &str) -> Result<(), Error> {
+        println!("Listen: {channel:?}");
         self.connection()
             .await?
             .execute(&*format!(r#"LISTEN "{}""#, ident(channel)))
             .await?;
+        println!("Done");
 
         self.channels.push(channel.to_owned());
 
@@ -265,13 +268,22 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let mut manager = self
-                .connection()
-                .await?
-                .pipe_message(|_| Ok(PipeUntil::NumMessages { num_responses: 1 }))?;
+            println!("Waiting msg");
+            let manager = match self.notif_buff {
+                Some(ref mut buff) => buff,
+                None => {
+                    let manager = self
+                        .connection()
+                        .await?
+                        .pipe_message(|_| Ok(PipeUntil::NumMessages { num_responses: 1 }))?;
+                    self.notif_buff = Some(manager.into_inner().1);
+                    self.notif_buff.as_mut().unwrap()
+                }
+            };
 
-            let next_message = manager.recv_unchecked();
+            let next_message = manager.next();
 
+            println!("Waiting new message");
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
                 // before `next_message` returns, or if the pool was already closed
@@ -279,40 +291,43 @@ impl PgListener {
             } else {
                 next_message.await
             };
+            println!("Got: {:?}", res);
 
             let message = match res {
-                Ok(message) => message,
-
-                // The connection is dead, ensure that it is dropped,
-                // update self state, and loop to try again.
-                Err(Error::Io(err))
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::ConnectionAborted |
-                        io::ErrorKind::UnexpectedEof |
-                        // see ERRORS section in tcp(7) man page (https://man7.org/linux/man-pages/man7/tcp.7.html)
-                        io::ErrorKind::TimedOut |
-                        io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    if let Some(mut conn) = self.connection.take() {
-                        self.buffer_tx = conn.inner.notifications.take();
-                        // Close the connection in a background task, so we can continue.
-                        conn.close_on_drop();
-                    }
-
-                    if self.eager_reconnect {
-                        self.connect_if_needed().await?;
-                    }
-
-                    // lost connection
-                    return Ok(None);
+                Some(message) => {
+                    self.notif_buff.take();
+                    message
                 }
+                None => return Err(Error::WorkerCrashed), // The connection is dead, ensure that it is dropped,
+                                                          // update self state, and loop to try again.
+                                                          // Err(Error::Io(err))
+                                                          //     if matches!(
+                                                          //         err.kind(),
+                                                          //         io::ErrorKind::ConnectionAborted |
+                                                          //         io::ErrorKind::UnexpectedEof |
+                                                          //         // see ERRORS section in tcp(7) man page (https://man7.org/linux/man-pages/man7/tcp.7.html)
+                                                          //         io::ErrorKind::TimedOut |
+                                                          //         io::ErrorKind::BrokenPipe
+                                                          //     ) =>
+                                                          // {
+                                                          //     if let Some(mut conn) = self.connection.take() {
+                                                          //         self.buffer_tx = conn.inner.notifications.take();
+                                                          //         // Close the connection in a background task, so we can continue.
+                                                          //         conn.close_on_drop();
+                                                          //     }
 
-                // Forward other errors
-                Err(error) => {
-                    return Err(error);
-                }
+                                                          //     if self.eager_reconnect {
+                                                          //         self.connect_if_needed().await?;
+                                                          //     }
+
+                                                          //     // lost connection
+                                                          //     return Ok(None);
+                                                          // }
+
+                                                          // // Forward other errors
+                                                          // Err(error) => {
+                                                          //     return Err(error);
+                                                          // }
             };
 
             match message.format {
