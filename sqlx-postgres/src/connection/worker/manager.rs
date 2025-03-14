@@ -83,7 +83,10 @@ impl<'c> ConnManager<'c> {
     }
 
     pub(crate) async fn recv_unchecked(&mut self) -> Result<ReceivedMessage, Error> {
-        self.receiver.next().await.ok_or(Error::WorkerCrashed)
+        self.receiver
+            .next()
+            .await
+            .ok_or_else(|| Error::WorkerCrashed)
     }
 
     // Get the next message from the server
@@ -120,10 +123,8 @@ impl<'c> ConnManager<'c> {
                             }
                         }
                         _ => {
-                            let mut param_statusses =
-                                // TODO: ERROR
-                                self.conn.inner.parameter_statuses.write().expect("");
-                            param_statusses.insert(name, value);
+                            self.conn
+                                .with_lock(|inner| inner.parameter_statuses.insert(name, value));
                         }
                     }
 

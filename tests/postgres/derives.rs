@@ -20,13 +20,13 @@ struct TransparentArray(Vec<i64>);
 
 #[sqlx_macros::test]
 async fn test_transparent_slice_to_array() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let values = vec![Transparent(1), Transparent(2), Transparent(3)];
 
     sqlx::query("SELECT 2 = ANY($1);")
         .bind(&values)
-        .fetch_one(&mut conn)
+        .fetch_one(&conn)
         .await?;
 
     Ok(())
@@ -178,7 +178,7 @@ test_type!(floatrange<FloatRange>(Postgres,
 
 #[sqlx_macros::test]
 async fn test_enum_type() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     conn.execute(
         r#"
@@ -216,7 +216,7 @@ CREATE TABLE people (
 
     // Drop and re-acquire the connection
     conn.close().await?;
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     // Select from table test
     let (people_id,): (i32,) = sqlx::query_as(
@@ -227,12 +227,12 @@ RETURNING id
         ",
     )
     .bind(Mood::Sad)
-    .fetch_one(&mut conn)
+    .fetch_one(&conn)
     .await?;
 
     // Drop and re-acquire the connection
     conn.close().await?;
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     #[derive(sqlx::FromRow)]
     struct PeopleRow {
@@ -246,7 +246,7 @@ SELECT id, mood FROM people WHERE id = $1
             ",
     )
     .bind(people_id)
-    .fetch_one(&mut conn)
+    .fetch_one(&conn)
     .await?;
 
     assert_eq!(rec.id, people_id);

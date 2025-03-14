@@ -398,12 +398,12 @@ WHERE rngtypid = $1
 
     /// Check whether EXPLAIN statements are supported by the current connection
     fn is_explain_available(&self) -> bool {
-        // TODO(JoeydeWaal): errormsg
-        let parameter_statuses = &self.inner.parameter_statuses.read().expect("ERROR");
-        let is_cockroachdb = parameter_statuses.contains_key("crdb_version");
-        let is_materialize = parameter_statuses.contains_key("mz_version");
-        let is_questdb = parameter_statuses.contains_key("questdb_version");
-        !is_cockroachdb && !is_materialize && !is_questdb
+        self.with_lock(|inner| {
+            let is_cockroachdb = inner.parameter_statuses.contains_key("crdb_version");
+            let is_materialize = inner.parameter_statuses.contains_key("mz_version");
+            let is_questdb = inner.parameter_statuses.contains_key("questdb_version");
+            !is_cockroachdb && !is_materialize && !is_questdb
+        })
     }
 
     pub(crate) async fn get_nullable_for_columns(

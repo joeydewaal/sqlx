@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
-use std::sync::RwLock;
+use std::sync::Mutex;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
@@ -45,15 +44,12 @@ pub struct PgConnectionInner {
     // Channel to the background worker
     pub(crate) chan: UnboundedSender<IoRequest>,
 
-    // underlying TCP or UDS stream,
-    // wrapped in a potentially TLS stream,
-    // wrapped in a buffered stream
-    // pub(crate) stream: PgStream,
+    // buffer of unreceived notification messages from `PUBLISH`
+    // this is set when creating a PgListener and only written to if that listener is
+    // re-used for query execution in-between receiving messages
     pub(crate) notifications: Option<UnboundedSender<Notification>>,
 
-    pub(crate) parameter_statuses: RwLock<BTreeMap<String, String>>,
-
-    pub(crate) server_version_num: AtomicU32,
+    shared_inner: Mutex<PgSharedInner>,
 
     // process id of this backend
     // used to send cancel requests
@@ -75,25 +71,27 @@ pub struct PgConnectionInner {
 
     type_cache: TypeCache,
 
-    // current transaction status
-    #[allow(dead_code)]
-    transaction_status: AtomicU8,
-    pub(crate) transaction_depth: AtomicUsize,
-
     log_settings: LogSettings,
+}
+
+pub struct PgSharedInner {
+    pub(crate) parameter_statuses: BTreeMap<String, String>,
+
+    pub(crate) server_version_num: Option<u32>,
+
+    // current transaction status
+    transaction_status: TransactionStatus,
+    pub(crate) transaction_depth: usize,
 }
 
 impl PgConnection {
     /// the version number of the server in `libpq` format
     pub fn server_version_num(&self) -> Option<u32> {
-        let version = self.inner.server_version_num.load(Ordering::Relaxed);
-        (version != 0).then(|| version)
+        self.with_lock(|inner| inner.server_version_num)
     }
 
     pub(super) fn set_server_version_num(&self, version_num: u32) {
-        self.inner
-            .server_version_num
-            .store(version_num, Ordering::Relaxed);
+        self.with_lock(|inner| inner.server_version_num = Some(version_num));
     }
 
     /// Queue a simple query (not prepared) to execute the next time this connection is used.
@@ -108,20 +106,18 @@ impl PgConnection {
     }
 
     pub(crate) fn transaction_depth(&self) -> usize {
-        self.inner.transaction_depth.load(Ordering::Acquire)
+        self.with_lock(|inner| inner.transaction_depth)
     }
 
     pub(crate) fn increment_transaction_depth(&self) {
-        self.inner.transaction_depth.fetch_add(1, Ordering::AcqRel);
+        self.with_lock(|inner| inner.transaction_depth += 1);
     }
 
     pub(crate) fn decrement_transaction_depth(&self) {
-        self.inner.transaction_depth.fetch_sub(1, Ordering::AcqRel);
+        self.with_lock(|inner| inner.transaction_depth -= 1);
     }
     fn set_transaction_status(&self, status: TransactionStatus) {
-        self.inner
-            .transaction_status
-            .store(status as u8, Ordering::Release);
+        self.with_lock(|inner| inner.transaction_status = status);
     }
 
     fn pipe_msg_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
@@ -157,11 +153,22 @@ impl PgConnection {
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
-        match self.inner.transaction_status.load(Ordering::Relaxed) {
-            b'T' => true,
-            b'E' | b'I' => false,
-            _ => panic!(),
-        }
+        self.with_lock(|inner| match inner.transaction_status {
+            TransactionStatus::Transaction => true,
+            TransactionStatus::Error | TransactionStatus::Idle => false,
+        })
+    }
+
+    pub(crate) fn with_lock<F, O>(&self, callback: F) -> O
+    where
+        F: FnOnce(&mut PgSharedInner) -> O,
+    {
+        let mut locked = self
+            .inner
+            .shared_inner
+            .lock()
+            .expect("BUG: Could not get lock");
+        callback(&mut locked)
     }
 
     fn new(options: &PgConnectOptions, chan: UnboundedSender<IoRequest>) -> Self {
@@ -169,15 +176,18 @@ impl PgConnection {
             inner: Box::new(PgConnectionInner {
                 chan,
                 notifications: None,
-                parameter_statuses: BTreeMap::new().into(),
-                server_version_num: AtomicU32::new(0),
+                shared_inner: PgSharedInner {
+                    parameter_statuses: BTreeMap::new(),
+                    server_version_num: None,
+                    transaction_status: TransactionStatus::Idle,
+                    transaction_depth: 0,
+                }
+                .into(),
                 process_id: 0,
                 secret_key: 0,
                 stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
                 stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
                 type_cache: TypeCache::new(),
-                transaction_status: AtomicU8::new(0),
-                transaction_depth: AtomicUsize::new(0),
                 log_settings: options.log_settings.clone(),
             }),
         }

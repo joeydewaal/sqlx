@@ -3,16 +3,16 @@ use sqlx_core::{io::ProtocolEncode, Error};
 
 use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage, ReceivedMessage};
 
-/// Pipes responses from the background worker until one of the variants.
+/// Pipes responses from the background worker to the sender until one of these conditions is met.
 #[derive(Debug, PartialEq)]
 pub enum PipeUntil {
     /// Waits until the worker got n number of messages. In general this should only be used if the
     /// number of responses is 0. There could be any types of request be sent asynchronously, like
     /// [NotificationResponse], [ParameterStatus] or [NoticeResponse].
     NumResponses(usize),
-    /// Waits until the worker received a [ReadyForQuery] response.
+    /// Worker waits until it received a [ReadyForQuery] response.
     ReadyForQuery,
-    /// Waits until the worker received one of these responses.
+    /// Worker waits until it received one of these responses.
     Either {
         left: BackendMessageFormat,
         right: BackendMessageFormat,
@@ -25,7 +25,21 @@ pub struct IoRequest {
     pub chan: UnboundedSender<ReceivedMessage>,
     pub data: Vec<u8>,
     pub send_until: PipeUntil,
-    pub id: usize,
+}
+
+impl IoRequest {
+    pub fn handle_done(&mut self, format: BackendMessageFormat) -> bool {
+        match self.send_until {
+            PipeUntil::NumResponses(ref mut num) => {
+                // num can never be 0 here because a `PipeUntil::NumResponses` that needs 0
+                // responses is never pushed into the backlog.
+                *num -= 1;
+                *num == 0
+            }
+            PipeUntil::ReadyForQuery => format == BackendMessageFormat::ReadyForQuery,
+            PipeUntil::Either { left, right } => left == format || right == format,
+        }
+    }
 }
 
 pub struct MessageBuf {
@@ -52,7 +66,7 @@ impl MessageBuf {
         value.encode_with(&mut self.data, context)
     }
 
-    /// Writes a [Sync] message in the buffe and returns a `PipeUntil::ReadyForQuery` for
+    /// Writes a [Sync] message in the buffer and returns a `PipeUntil::ReadyForQuery` for
     /// convenience.
     #[inline(always)]
     pub fn write_sync(&mut self) -> sqlx_core::Result<PipeUntil> {
@@ -69,7 +83,6 @@ impl MessageBuf {
     pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
         let (chan, receiver) = unbounded();
         let req = IoRequest {
-            id: 0,
             send_until: ends_at,
             data: self.data,
             chan,
