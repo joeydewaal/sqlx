@@ -84,9 +84,7 @@ impl TransactionManager for PgTransactionManager {
     }
 
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize {
-        conn.inner
-            .transaction_depth
-            .load(std::sync::atomic::Ordering::Relaxed)
+        conn.with_lock(|inner| inner.transaction_depth)
     }
 }
 
