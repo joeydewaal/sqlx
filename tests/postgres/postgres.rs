@@ -606,7 +606,6 @@ async fn it_can_drop_multiple_transactions() -> anyhow::Result<()> {
 async fn pool_smoke_test() -> anyhow::Result<()> {
     use futures::{future, task::Poll, Future};
 
-
     let pool = PgPoolOptions::new()
         .acquire_timeout(Duration::from_secs(5))
         .min_connections(1)

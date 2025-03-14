@@ -72,7 +72,6 @@ impl Future for Worker {
             }
         }
 
-
         // Flush the write buffer if needed.
         if self.should_flush {
             if let Poll::Ready(_) = self.conn.poll_flush(cx) {
@@ -90,7 +89,6 @@ impl Future for Worker {
                         return Poll::Pending;
                     }
                 };
-
 
                 let format = response.format;
                 let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
