@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::RwLock;
 
 use futures_channel::mpsc::UnboundedSender;
@@ -77,7 +77,7 @@ pub struct PgConnectionInner {
 
     // current transaction status
     #[allow(dead_code)]
-    transaction_status: TransactionStatus,
+    transaction_status: AtomicU8,
     pub(crate) transaction_depth: AtomicUsize,
 
     log_settings: LogSettings,
@@ -121,6 +121,11 @@ impl PgConnection {
         // TODO(JoeydeWaal): Ordering
         self.inner.transaction_depth.fetch_sub(1, Ordering::Relaxed);
     }
+    fn set_transaction_status(&self, status: TransactionStatus) {
+        self.inner
+            .transaction_status
+            .store(status as u8, Ordering::Release);
+    }
 
     fn pipe_msg_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
     where
@@ -155,9 +160,10 @@ impl PgConnection {
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
-        match self.inner.transaction_status {
-            TransactionStatus::Transaction => true,
-            TransactionStatus::Error | TransactionStatus::Idle => false,
+        match self.inner.transaction_status.load(Ordering::Relaxed) {
+            b'T' => true,
+            b'E' | b'I' => false,
+            _ => panic!(),
         }
     }
 
@@ -173,7 +179,7 @@ impl PgConnection {
                 stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
                 stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
                 type_cache: TypeCache::new(),
-                transaction_status: TransactionStatus::Idle,
+                transaction_status: AtomicU8::new(0),
                 transaction_depth: AtomicUsize::new(0),
                 log_settings: options.log_settings.clone(),
             }),
