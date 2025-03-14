@@ -1,5 +1,3 @@
-use std::sync::atomic::Ordering;
-
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
 use crate::message::{
@@ -129,9 +127,8 @@ impl PgConnection {
 
         conn.inner.process_id = process_id;
         conn.inner.secret_key = secret_key;
-        conn.inner
-            .transaction_status
-            .store(transaction_status as u8, Ordering::Release);
+
+        conn.set_transaction_status(transaction_status);
 
         Ok(conn)
     }

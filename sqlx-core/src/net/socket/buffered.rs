@@ -2,6 +2,7 @@ use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
 use futures_util::FutureExt;
+use std::io::Write;
 use std::ops::ControlFlow;
 use std::task::{ready, Context, Poll};
 use std::{cmp, io};
@@ -86,6 +87,16 @@ impl<S: Socket> BufferedSocket<S> {
         self.write_buf.bytes_written = self.write_buf.buf.len();
         self.write_buf.sanity_check();
 
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn write_raw(&mut self, value: &[u8]) -> Result<(), Error> {
+        let buff = self.write_buffer_mut();
+
+        buff.buf_mut().write_all(value)?;
+        buff.bytes_written += value.len();
+        buff.sanity_check();
         Ok(())
     }
 
@@ -175,6 +186,9 @@ impl<S: Socket> BufferedSocket<S> {
         self.socket.flush().await?;
 
         Ok(())
+    }
+    pub fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_shutdown(cx)
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {
