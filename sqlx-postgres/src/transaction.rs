@@ -20,7 +20,7 @@ impl TransactionManager for PgTransactionManager {
         statement: Option<Cow<'static, str>>,
     ) -> BoxFuture<'conn, Result<(), Error>> {
         Box::pin(async move {
-            let depth = conn.inner.transaction_depth;
+            let depth = conn.transaction_depth();
             let statement = match statement {
                 // custom `BEGIN` statements are not allowed if we're already in
                 // a transaction (we need to issue a `SAVEPOINT` instead)
@@ -31,16 +31,16 @@ impl TransactionManager for PgTransactionManager {
 
             let rollback = Rollback::new(conn);
 
-            rollback.conn.queue_simple_query(&statement)?;
-            rollback.conn.wait_until_ready().await?;
+            let mut manager = rollback.conn.queue_simple_query(&statement)?;
+            manager.wait_ready_for_query().await?;
+
+            println!("{}", rollback.conn.in_transaction());
             if !rollback.conn.in_transaction() {
                 return Err(Error::BeginFailed);
             }
-            rollback.conn.inner.transaction_depth += 1;
-            // rollback.conn.wait_until_ready().await?;
-            manager.wait_ready_for_query().await?;
-            rollback.defuse();
 
+            rollback.conn.increment_transaction_depth();
+            rollback.defuse();
             Ok(())
         })
     }
@@ -84,7 +84,9 @@ impl TransactionManager for PgTransactionManager {
     }
 
     fn get_transaction_depth(conn: &<Self::Database as Database>::Connection) -> usize {
-        conn.inner.transaction_depth
+        conn.inner
+            .transaction_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
