@@ -42,6 +42,10 @@ impl<T> StatementCache<T> {
         self.inner.remove(k)
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &T)> {
+        self.inner.iter()
+    }
+
     /// The number of statements in the cache.
     pub fn len(&self) -> usize {
         self.inner.len()

@@ -127,13 +127,7 @@ impl PgConnection {
             return Ok(statement);
         }
 
-        let statement = match prepare(self, sql, parameters, metadata).await {
-            Ok(s) => s,
-            Err(e) => {
-                self.inner.stmt_cache.remove_notify(sql);
-                return Err(e);
-            }
-        };
+        let statement = prepare(self, sql, parameters, metadata).await?;
 
         if store_to_cache {
             if let Some((id, _)) = self.inner.stmt_cache.checked_insert(sql, statement.clone()) {
@@ -144,8 +138,6 @@ impl PgConnection {
                 manager.wait_for_close_complete(1).await?;
                 manager.recv_ready_for_query().await?;
             }
-        } else {
-            self.inner.stmt_cache.remove_notify(sql);
         }
 
         Ok(statement)

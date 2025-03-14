@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use sqlx_core::{common::StatementCache, rt::ManualResetEvent};
+use sqlx_core::{common::StatementCache, rt::Notify};
 
 use super::{PgStatementMetadata, StatementId};
 
@@ -14,7 +14,7 @@ pub enum StatementStatus {
         metadata: Arc<PgStatementMetadata>,
     },
     InFlight {
-        semaphore: Arc<ManualResetEvent>,
+        semaphore: Arc<Notify>,
     },
 }
 
@@ -37,7 +37,7 @@ impl SharedStatementCache {
         let mut this = self.lock();
         match this.get_mut(stmt) {
             Some(StatementStatus::InFlight { semaphore }) => {
-                semaphore.set();
+                semaphore.notify();
                 let _ = this.remove(stmt);
             }
             _ => {}
@@ -46,7 +46,7 @@ impl SharedStatementCache {
 
     pub async fn get(&self, stmt: &str) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
         for _ in 0..2 {
-            let opt_semaphore: Option<Arc<ManualResetEvent>> = {
+            let opt_semaphore: Option<Arc<Notify>> = {
                 let mut this = self.lock();
                 if let Some(state) = this.get_mut(stmt).cloned() {
                     match state {
@@ -65,7 +65,7 @@ impl SharedStatementCache {
                     this.insert(
                         stmt,
                         StatementStatus::InFlight {
-                            semaphore: Arc::new(ManualResetEvent::new(false)),
+                            semaphore: Arc::new(Notify::new().notify_on_drop(true)),
                         },
                     );
                     return None;
@@ -74,8 +74,7 @@ impl SharedStatementCache {
 
             if let Some(sem) = opt_semaphore {
                 let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.wait()).await;
-                if result.is_err() {
-                }
+                if result.is_err() {}
             }
         }
         None
@@ -106,7 +105,7 @@ impl SharedStatementCache {
                         metadata,
                     } => return Some((statement_id, metadata)),
                     StatementStatus::InFlight { semaphore } => {
-                        semaphore.set();
+                        semaphore.notify();
                         return None;
                     }
                 }
@@ -118,6 +117,8 @@ impl SharedStatementCache {
 
     pub fn cached_statements_size(&self) -> usize {
         let this = self.lock();
-        this.len()
+        this.iter()
+            .filter(|(_, v)| matches!(v, StatementStatus::Cached { .. }))
+            .count()
     }
 }

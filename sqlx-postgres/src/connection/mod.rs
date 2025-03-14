@@ -258,11 +258,17 @@ impl Connection for PgConnection {
 
             let mut manager = self.pipe_message(|messages| {
                 let mut stmt_cache = self.inner.stmt_cache.lock();
-                while let Some(StatementStatus::Cached {
-                    statement_id,
-                    metadata: _,
-                }) = stmt_cache.remove_lru()
-                {
+
+                while let Some(stmt) = stmt_cache.remove_lru() {
+                    let statement_id = match stmt {
+                        StatementStatus::Cached {
+                            statement_id,
+                            metadata: _,
+                        } => statement_id,
+                        StatementStatus::InFlight { semaphore: _ } => {
+                            continue;
+                        }
+                    };
                     messages.write_msg(Close::Statement(statement_id))?;
                     cleared += 1;
                 }
