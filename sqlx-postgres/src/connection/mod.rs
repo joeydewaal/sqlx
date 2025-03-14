@@ -108,18 +108,15 @@ impl PgConnection {
     }
 
     pub(crate) fn transaction_depth(&self) -> usize {
-        // TODO(JoeydeWaal): Ordering
         self.inner.transaction_depth.load(Ordering::Acquire)
     }
 
     pub(crate) fn increment_transaction_depth(&self) {
-        // TODO(JoeydeWaal): Ordering
-        self.inner.transaction_depth.fetch_add(1, Ordering::Relaxed);
+        self.inner.transaction_depth.fetch_add(1, Ordering::AcqRel);
     }
 
     pub(crate) fn decrement_transaction_depth(&self) {
-        // TODO(JoeydeWaal): Ordering
-        self.inner.transaction_depth.fetch_sub(1, Ordering::Relaxed);
+        self.inner.transaction_depth.fetch_sub(1, Ordering::AcqRel);
     }
     fn set_transaction_status(&self, status: TransactionStatus) {
         self.inner

@@ -3,7 +3,7 @@ use sqlx_test::new;
 
 #[sqlx_macros::test]
 async fn it_describes_simple() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let d = conn.describe("SELECT * FROM tweet").await?;
 
@@ -27,7 +27,7 @@ async fn it_describes_simple() -> anyhow::Result<()> {
 
 #[sqlx_macros::test]
 async fn it_describes_expression() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let d = conn.describe("SELECT 1::int8 + 10").await?;
 
@@ -44,7 +44,7 @@ async fn it_describes_expression() -> anyhow::Result<()> {
 
 #[sqlx_macros::test]
 async fn it_describes_enum() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let d = conn.describe("SELECT 'open'::status as _1").await?;
 
@@ -64,7 +64,7 @@ async fn it_describes_enum() -> anyhow::Result<()> {
 
 #[sqlx_macros::test]
 async fn it_describes_record() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let d = conn.describe("SELECT (true, 10::int2)").await?;
 
@@ -76,7 +76,7 @@ async fn it_describes_record() -> anyhow::Result<()> {
 
 #[sqlx_macros::test]
 async fn it_describes_composite() -> anyhow::Result<()> {
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     let d = conn
         .describe("SELECT ROW('name',10,500)::inventory_item")
