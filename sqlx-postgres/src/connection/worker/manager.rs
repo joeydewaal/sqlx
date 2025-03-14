@@ -35,7 +35,8 @@ impl<'c> ConnManager<'c> {
     }
 
     pub async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
-        let _: ReadyForQuery = self.recv_expect().await?;
+        let r: ReadyForQuery = self.recv_expect().await?;
+        self.conn.set_transaction_status(r.transaction_status);
         Ok(())
     }
 
@@ -44,6 +45,9 @@ impl<'c> ConnManager<'c> {
             let message = self.recv().await?;
 
             if let BackendMessageFormat::ReadyForQuery = message.format {
+                let r: ReadyForQuery = message.decode()?;
+
+                self.conn.set_transaction_status(r.transaction_status);
                 break;
             }
         }
@@ -117,6 +121,7 @@ impl<'c> ConnManager<'c> {
                         }
                         _ => {
                             let mut param_statusses =
+                                // TODO: ERROR
                                 self.conn.inner.parameter_statuses.write().expect("");
                             param_statusses.insert(name, value);
                         }
