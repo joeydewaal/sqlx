@@ -1,10 +1,9 @@
 use std::{
     collections::VecDeque,
     future::Future,
-    io::Write,
     ops::ControlFlow,
     pin::Pin,
-    task::{Context, Poll},
+    task::{ready, Context, Poll},
 };
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
@@ -15,7 +14,7 @@ use sqlx_core::{
     rt::spawn,
 };
 
-use crate::message::{BackendMessageFormat, ReceivedMessage};
+use crate::message::{BackendMessageFormat, FrontendMessage, ReceivedMessage, Terminate};
 
 use super::PgStream;
 
@@ -25,8 +24,19 @@ mod message;
 pub use manager::ConnManager;
 pub use message::{IoRequest, MessageBuf, PipeUntil};
 
+#[derive(PartialEq)]
+enum WorkerState {
+    // The connection is open and in business.
+    Open,
+    // Responding to last messages but not receiving new ones.
+    // Sending terminaate message and closing the socket.
+    Closing,
+    // Connection is fully closed.
+    Closed,
+}
+
 pub struct Worker {
-    ids: usize,
+    state: WorkerState,
     should_flush: bool,
     chan: UnboundedReceiver<IoRequest>,
     back_log: VecDeque<IoRequest>,
@@ -38,7 +48,7 @@ impl Worker {
         let (tx, rx) = unbounded();
 
         let conn = Worker {
-            ids: 0,
+            state: WorkerState::Open,
             should_flush: false,
             chan: rx,
             back_log: VecDeque::new(),
@@ -48,39 +58,62 @@ impl Worker {
         spawn(conn);
         tx
     }
-}
 
-impl Future for Worker {
-    type Output = sqlx_core::Result<()>;
+    // Tries to receive the next message from the channel. Also handles termination if needed.
+    fn poll_next_request(&mut self, cx: &mut Context<'_>) -> Option<IoRequest> {
+        // We only try to receive new messages if we are open.
+        if self.state != WorkerState::Open {
+            return None;
+        }
+        match self.chan.poll_next_unpin(cx) {
+            Poll::Pending => None,
+            Poll::Ready(Some(request)) => Some(request),
+            Poll::Ready(None) => {
+                // Channel was closed, explicitly or because the connection was dropped. Either way
+                // we should start a gracefull shutdown.
+                self.conn
+                    .write_raw(&[Terminate::FORMAT as u8, 0, 0, 0, 4])
+                    .unwrap();
+                self.state = WorkerState::Closing;
+                self.should_flush = true;
+                None
+            }
+        }
+    }
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // Push as many new messages in the write buffer.
-        // let start = Instant::now();
-        while let Poll::Ready(Some(mut msg)) = self.chan.poll_next_unpin(cx) {
-            msg.id = self.ids;
-            self.ids += 1;
+    #[inline(always)]
+    fn poll_receiver(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
+        // Try to receive a new io request from the channel.
+        while let Some(msg) = self.poll_next_request(cx) {
+            // Write the received message in the write buffer.
+            self.conn.write_raw(&msg.data)?;
+
+            // Ensure we flush the write buffer.
             self.should_flush = true;
-            let write_buff = self.conn.write_buffer_mut();
-            let buff = write_buff.buf_mut();
 
-            buff.write_all(&msg.data)?;
-            write_buff.bytes_written += msg.data.len();
-            write_buff.sanity_check();
-
+            // Only put the message in the write buffer if we need to respond.
             if !matches!(msg.send_until, PipeUntil::NumResponses(0)) {
                 self.back_log.push_back(msg);
             }
         }
+        Ok(())
+    }
 
-        // Flush the write buffer if needed.
+    #[inline(always)]
+    fn handle_poll_flush(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
         if self.should_flush {
             if let Poll::Ready(_) = self.conn.poll_flush(cx) {
                 self.should_flush = false;
             }
         }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn poll_backlog(&mut self, cx: &mut Context<'_>) -> Poll<sqlx_core::Result<()>> {
         while let Some(mut msg) = self.back_log.pop_front() {
             loop {
-                let response = match poll_next_message(&mut self.conn, cx) {
+                let response = match self.poll_next_message(cx) {
                     Poll::Ready(response) => response?,
                     Poll::Pending => {
                         // Not ready for receiving messages.
@@ -91,68 +124,92 @@ impl Future for Worker {
                 };
 
                 let format = response.format;
-                let is_rfq = response.format == BackendMessageFormat::ReadyForQuery;
+
+                // Send the response back to the sender. We ignore the error because even if the
+                // sender is closed we should keep receiving responses from the database.
                 let _ = msg.chan.unbounded_send(response).is_err();
 
-                match &mut msg.send_until {
-                    PipeUntil::ReadyForQuery => {
-                        if is_rfq {
-                            break;
-                        }
-                    }
-                    PipeUntil::NumResponses(num_responses) => {
-                        *num_responses -= 1;
-                        if *num_responses == 0 {
-                            break;
-                        }
-                    }
-                    PipeUntil::Either { left, right } => {
-                        if format == *left || format == *right {
-                            break;
-                        }
-                    }
+                // See if we should keep sending responses back.
+                if msg.handle_done(format) {
+                    // Remove the received message and move on to the next one.
+                    drop(msg);
+                    break;
                 }
             }
         }
+
+        if self.back_log.is_empty() && self.state == WorkerState::Closing {
+            self.state = WorkerState::Closed;
+            return self.conn.poll_shutdown(cx).map_err(Into::into);
+        }
         Poll::Pending
     }
-}
-pub fn poll_next_message(
-    conn: &mut BufferedSocket<Box<dyn Socket>>,
-    cx: &mut Context<'_>,
-) -> Poll<sqlx_core::Result<ReceivedMessage>> {
-    let x = conn.poll_try_read(cx, |buf| {
-        // all packets in postgres start with a 5-byte header
-        // this header contains the message type and the total length of the message
-        let Some(mut header) = buf.get(..5) else {
-            return Ok(ControlFlow::Continue(5));
-        };
 
-        let format = BackendMessageFormat::try_from_u8(header.get_u8())?;
+    #[inline(always)]
+    pub fn poll_next_message(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<sqlx_core::Result<ReceivedMessage>> {
+        let x = self.conn.poll_try_read(cx, |buf| {
+            // all packets in postgres start with a 5-byte header
+            // this header contains the message type and the total length of the message
+            let Some(mut header) = buf.get(..5) else {
+                return Ok(ControlFlow::Continue(5));
+            };
 
-        let message_len = header.get_u32() as usize;
+            let format = BackendMessageFormat::try_from_u8(header.get_u8())?;
 
-        let expected_len = message_len
-            .checked_add(1)
-            // this shouldn't really happen but is mostly a sanity check
-            .ok_or_else(|| err_protocol!("message_len + 1 overflows usize: {message_len}"))?;
+            let message_len = header.get_u32() as usize;
 
-        if buf.len() < expected_len {
-            return Ok(ControlFlow::Continue(expected_len));
+            let expected_len = message_len
+                .checked_add(1)
+                // this shouldn't really happen but is mostly a sanity check
+                .ok_or_else(|| err_protocol!("message_len + 1 overflows usize: {message_len}"))?;
+
+            if buf.len() < expected_len {
+                return Ok(ControlFlow::Continue(expected_len));
+            }
+
+            // `buf` SHOULD NOT be modified ABOVE this line
+
+            // pop off the format code since it's not counted in `message_len`
+            buf.advance(1);
+
+            // consume the message, including the length prefix
+            let mut contents = buf.split_to(message_len).freeze();
+
+            // cut off the length prefix
+            contents.advance(4);
+
+            Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
+        });
+        x
+    }
+
+    #[inline(always)]
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        if self.state == WorkerState::Closed {
+            self.conn.poll_shutdown(cx)
+        } else {
+            Poll::Ready(Ok(()))
         }
+    }
+}
 
-        // `buf` SHOULD NOT be modified ABOVE this line
+impl Future for Worker {
+    type Output = sqlx_core::Result<()>;
 
-        // pop off the format code since it's not counted in `message_len`
-        buf.advance(1);
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Only poll the future if we're not closed/closing.
+        ready!(self.poll_shutdown(cx)?);
 
-        // consume the message, including the length prefix
-        let mut contents = buf.split_to(message_len).freeze();
+        // Push as many new messages in the write buffer as we can.
+        self.poll_receiver(cx)?;
 
-        // cut off the length prefix
-        contents.advance(4);
+        // Flush the write buffer if needed.
+        self.handle_poll_flush(cx)?;
 
-        Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
-    });
-    x
+        // Try to receive responses for Postgres and send them back.
+        self.poll_backlog(cx)
+    }
 }
