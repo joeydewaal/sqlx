@@ -457,7 +457,7 @@ mod json {
 
     #[sqlx_macros::test]
     async fn test_json_raw_value() -> anyhow::Result<()> {
-        let mut conn = new::<Postgres>().await?;
+        let conn = new::<Postgres>().await?;
 
         // unprepared, text API
         let row: PgRow = conn
@@ -704,7 +704,7 @@ async fn test_text_adapter() -> anyhow::Result<()> {
         login_at: time::OffsetDateTime,
     }
 
-    let mut conn = new::<Postgres>().await?;
+    let conn = new::<Postgres>().await?;
 
     conn.execute(
         r#"
@@ -723,12 +723,12 @@ CREATE TEMPORARY TABLE user_login (
     sqlx::query("INSERT INTO user_login (user_id, socket_addr) VALUES ($1, $2)")
         .bind(user_id)
         .bind(Text(socket_addr))
-        .execute(&mut conn)
+        .execute(&conn)
         .await?;
 
     let last_login: Login =
         sqlx::query_as("SELECT * FROM user_login ORDER BY login_at DESC LIMIT 1")
-            .fetch_one(&mut conn)
+            .fetch_one(&conn)
             .await?;
 
     assert_eq!(last_login.user_id, user_id);
