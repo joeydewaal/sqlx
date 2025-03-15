@@ -1,3 +1,4 @@
+use futures::stream::FuturesOrdered;
 use futures::{Stream, StreamExt, TryStreamExt};
 
 use sqlx::postgres::types::Oid;
@@ -2114,4 +2115,25 @@ async fn it_can_recover_from_copy_in_invalid_params() -> anyhow::Result<()> {
         "invalid_param",
     )
     .await
+}
+
+#[sqlx_macros::test]
+async fn it_can_pipeline_queries() -> anyhow::Result<()> {
+    let conn = new::<Postgres>().await?;
+
+    let nums: Vec<i64> = (0i64..10_000).collect();
+
+    let queries: FuturesOrdered<_> = nums
+        .iter()
+        .map(|i| {
+            sqlx::query_scalar::<_, i64>("select $1::INT8")
+                .bind(i)
+                .fetch_one(&conn)
+        })
+        .collect();
+
+    let fetched_nums: Vec<i64> = queries.try_collect().await?;
+
+    assert!(nums == fetched_nums);
+    Ok(())
 }
