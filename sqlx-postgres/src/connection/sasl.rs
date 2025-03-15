@@ -1,8 +1,6 @@
 use crate::connection::worker::PipeUntil;
 use crate::error::Error;
-use crate::message::{
-    Authentication, AuthenticationSasl, EncodeMessage, SaslInitialResponse, SaslResponse,
-};
+use crate::message::{Authentication, AuthenticationSasl, SaslInitialResponse, SaslResponse};
 use crate::PgConnectOptions;
 use hmac::{Hmac, Mac};
 use rand::Rng;
@@ -146,8 +144,8 @@ pub(crate) async fn authenticate<'c>(
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
     BASE64_STANDARD.encode_string(client_proof, &mut client_final_message);
 
-    manager = conn.pipe_message(|message| {
-        message.write(EncodeMessage(SaslResponse(&client_final_message)))?;
+    manager = conn.start_pipe(|message| {
+        message.write_msg(SaslResponse(&client_final_message))?;
         Ok(PipeUntil::ReadyForQuery)
     })?;
 

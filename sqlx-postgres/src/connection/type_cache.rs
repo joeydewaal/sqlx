@@ -4,6 +4,9 @@ use sqlx_core::{ext::ustr::UStr, HashMap};
 
 use crate::{type_info::PgArrayOf, types::Oid, PgTypeInfo};
 
+/// A cache of user defined types.
+///
+/// TODO: This could be shared through `PgConnectOptions`.
 pub struct TypeCache {
     inner: RwLock<TypeCacheMut>,
 }
