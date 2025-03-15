@@ -13,7 +13,7 @@ use tracing::Instrument;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
-use crate::message::{BackendMessageFormat, Notification, ReceivedMessage};
+use crate::message::{BackendMessageFormat, Notification, ReadyForQuery, ReceivedMessage};
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
 use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, PipeUntil, Postgres};
@@ -273,11 +273,14 @@ impl PgListener {
                         .connection()
                         .await?
                         .start_pipe(|_| Ok(PipeUntil::NumResponses(1)))?;
-                    self.notif_buff = Some(manager.into_inner().1);
-                    self.notif_buff.as_mut().unwrap()
+
+                    let chan = manager.into_inner().1;
+                    self.notif_buff.insert(chan)
                 }
             };
 
+            // This should always get sent one message. If this future is cancelled the message is
+            // lost.
             let next_message = manager.next();
 
             let res = if let Some(ref mut close_event) = close_event {
@@ -288,42 +291,10 @@ impl PgListener {
                 next_message.await
             };
 
-            let message = match res {
-                Some(message) => {
-                    self.notif_buff.take();
-                    message
-                }
-                None => return Err(Error::WorkerCrashed), // The connection is dead, ensure that it is dropped,
-                                                          // update self state, and loop to try again.
-                                                          // Err(Error::Io(err))
-                                                          //     if matches!(
-                                                          //         err.kind(),
-                                                          //         io::ErrorKind::ConnectionAborted |
-                                                          //         io::ErrorKind::UnexpectedEof |
-                                                          //         // see ERRORS section in tcp(7) man page (https://man7.org/linux/man-pages/man7/tcp.7.html)
-                                                          //         io::ErrorKind::TimedOut |
-                                                          //         io::ErrorKind::BrokenPipe
-                                                          //     ) =>
-                                                          // {
-                                                          //     if let Some(mut conn) = self.connection.take() {
-                                                          //         self.buffer_tx = conn.inner.notifications.take();
-                                                          //         // Close the connection in a background task, so we can continue.
-                                                          //         conn.close_on_drop();
-                                                          //     }
-
-                                                          //     if self.eager_reconnect {
-                                                          //         self.connect_if_needed().await?;
-                                                          //     }
-
-                                                          //     // lost connection
-                                                          //     return Ok(None);
-                                                          // }
-
-                                                          // // Forward other errors
-                                                          // Err(error) => {
-                                                          //     return Err(error);
-                                                          // }
+            let Some(message) = res else {
+                return Ok(None);
             };
+            self.notif_buff.take();
 
             match message.format {
                 // We've received an async notification, return it.
@@ -333,7 +304,9 @@ impl PgListener {
 
                 // Mark the connection as ready for another query
                 BackendMessageFormat::ReadyForQuery => {
-                    // self.connection().await?.inner.pending_ready_for_query_count -= 1;
+                    let m: ReadyForQuery = message.decode()?;
+                    let conn = self.connection().await?;
+                    conn.set_transaction_status(m.transaction_status);
                 }
 
                 // Ignore unexpected messages

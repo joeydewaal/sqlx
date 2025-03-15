@@ -115,7 +115,8 @@ impl PgConnection {
     pub(crate) fn decrement_transaction_depth(&self) {
         self.with_lock(|inner| inner.transaction_depth -= 1);
     }
-    fn set_transaction_status(&self, status: TransactionStatus) {
+
+    pub(crate) fn set_transaction_status(&self, status: TransactionStatus) {
         self.with_lock(|inner| inner.transaction_status = status);
     }
 
