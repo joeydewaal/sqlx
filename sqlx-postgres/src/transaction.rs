@@ -38,9 +38,9 @@ impl TransactionManager for PgTransactionManager {
             if !rollback.conn.in_transaction() {
                 return Err(Error::BeginFailed);
             }
-
             rollback.conn.increment_transaction_depth();
             rollback.defuse();
+
             Ok(())
         })
     }
@@ -48,6 +48,7 @@ impl TransactionManager for PgTransactionManager {
     fn commit(conn: &mut PgConnection) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             let transaction_depth = conn.transaction_depth();
+
             if transaction_depth > 0 {
                 conn.execute(&*commit_ansi_transaction_sql(transaction_depth))
                     .await?;
@@ -62,6 +63,7 @@ impl TransactionManager for PgTransactionManager {
     fn rollback(conn: &mut PgConnection) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
             let transaction_depth = conn.transaction_depth();
+
             if transaction_depth > 0 {
                 conn.execute(&*rollback_ansi_transaction_sql(transaction_depth))
                     .await?;
@@ -76,7 +78,9 @@ impl TransactionManager for PgTransactionManager {
     fn start_rollback(conn: &mut PgConnection) {
         let transaction_depth = conn.transaction_depth();
         if transaction_depth > 0 {
-            conn.queue_simple_query(&rollback_ansi_transaction_sql(transaction_depth))
+            // This sends the rollback message to the background worker.
+            let _ = conn
+                .queue_simple_query(&rollback_ansi_transaction_sql(transaction_depth))
                 .expect("BUG: Rollback query somehow too large for protocol");
 
             conn.decrement_transaction_depth();

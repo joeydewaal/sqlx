@@ -42,6 +42,9 @@ impl IoRequest {
     }
 }
 
+/// TODO: We could share a `BytesMut` in the connection itself and use that as the backing buffer
+/// instead of allocating a `Vec` every time, but this requires the `ProtocolEncode` trait to be
+/// chanced.
 pub struct MessageBuf {
     data: Vec<u8>,
 }
@@ -55,15 +58,7 @@ impl MessageBuf {
     where
         T: ProtocolEncode<'en, ()>,
     {
-        self.write_with(value, ())
-    }
-
-    #[inline(always)]
-    pub fn write_with<'en, T, C>(&mut self, value: T, context: C) -> sqlx_core::Result<()>
-    where
-        T: ProtocolEncode<'en, C>,
-    {
-        value.encode_with(&mut self.data, context)
+        value.encode(&mut self.data)
     }
 
     /// Writes a [Sync] message in the buffer and returns a `PipeUntil::ReadyForQuery` for
@@ -81,6 +76,8 @@ impl MessageBuf {
     }
 
     pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
+        // We're using an unbounded channel here for sending responses back mostly for
+        // convenience. Should this be changed to a bounded one?
         let (chan, receiver) = unbounded();
         let req = IoRequest {
             send_until: ends_at,

@@ -18,36 +18,23 @@ use futures_intrusive::sync::ManualResetEvent;
 
 pub struct Notify {
     event: ManualResetEvent,
-    notify_on_drop: bool,
 }
 
 impl Notify {
     pub fn new() -> Self {
         Self {
             event: ManualResetEvent::new(false),
-            notify_on_drop: false,
         }
     }
 
-    pub fn notify_on_drop(mut self, n: bool) -> Self {
-        self.notify_on_drop = n;
-        self
-    }
-
-    pub fn notify(&self) {
+    /// Notifies all waiters.
+    pub fn notify_all(&self) {
         self.event.set();
     }
 
-    pub async fn wait(&self) {
+    /// Waits for a notification.
+    pub async fn notified(&self) {
         self.event.wait().await
-    }
-}
-
-impl Drop for Notify {
-    fn drop(&mut self) {
-        if self.notify_on_drop {
-            self.notify();
-        }
     }
 }
 

@@ -66,15 +66,14 @@ pub struct PgConnectionInner {
     stmt_id_manager: StatementIdManager,
 
     // cache statement by query string to the id and columns
-    // cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
-    stmt_cache: SharedStatementCache,
+    cache_statement: SharedStatementCache,
 
-    type_cache: TypeCache,
+    cache_type: TypeCache,
 
     log_settings: LogSettings,
 }
 
-pub struct PgSharedInner {
+pub(crate) struct PgSharedInner {
     pub(crate) parameter_statuses: BTreeMap<String, String>,
 
     pub(crate) server_version_num: Option<u32>,
@@ -99,8 +98,8 @@ impl PgConnection {
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
     pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager, Error> {
-        self.pipe_message(|buff| {
-            buff.write_msg(Query(query))?;
+        self.start_pipe(|buf| {
+            buf.write_msg(Query(query))?;
             Ok(PipeUntil::ReadyForQuery)
         })
     }
@@ -120,24 +119,31 @@ impl PgConnection {
         self.with_lock(|inner| inner.transaction_status = status);
     }
 
-    fn pipe_msg_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
+    /// This should generally not be used, see `PipeUntil::NumResponses` for more info.
+    pub(crate) fn pipe_msg_once<'c, 'en, T>(
+        &'c self,
+        value: T,
+    ) -> sqlx_core::Result<ConnManager<'c>>
     where
         T: FrontendMessage,
     {
         self.pipe_once(EncodeMessage(value))
     }
 
+    /// This should generally not be used, see `PipeUntil::NumResponses` for more info.
     fn pipe_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
     where
         T: ProtocolEncode<'en, ()>,
     {
-        self.pipe_message(|buff| {
-            buff.write(value)?;
+        self.start_pipe(|buf| {
+            buf.write(value)?;
             Ok(PipeUntil::NumResponses(1))
         })
     }
 
-    pub fn pipe_message<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
+    /// Starts a temporary pipe to the background worker, the worker sends responses back until
+    /// the the condition of `PipeUntil` is met.
+    pub fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
     where
         F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
     {
@@ -186,8 +192,8 @@ impl PgConnection {
                 process_id: 0,
                 secret_key: 0,
                 stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
-                stmt_cache: SharedStatementCache::new(options.statement_cache_capacity),
-                type_cache: TypeCache::new(),
+                cache_statement: SharedStatementCache::new(options.statement_cache_capacity),
+                cache_type: TypeCache::new(),
                 log_settings: options.log_settings.clone(),
             }),
         }
@@ -233,9 +239,9 @@ impl Connection for PgConnection {
         // self.execute("/* SQLx ping */").map_ok(|_| ()).boxed()
 
         Box::pin(async move {
-            let mut manager = self.pipe_message(|message| {
+            let mut manager = self.start_pipe(|buf| {
                 // The simplest call-and-response that's possible.
-                message.write_sync()
+                buf.write_sync()
             })?;
             manager.recv_ready_for_query().await?;
             Ok(())
@@ -260,17 +266,17 @@ impl Connection for PgConnection {
     }
 
     fn cached_statements_size(&self) -> usize {
-        self.inner.stmt_cache.cached_statements_size()
+        self.inner.cache_statement.cached_statements_size()
     }
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.type_cache.clear_oid_cache();
+            self.inner.cache_type.clear_oid_cache();
 
             let mut cleared = 0_usize;
 
-            let mut manager = self.pipe_message(|messages| {
-                let mut stmt_cache = self.inner.stmt_cache.lock();
+            let mut manager = self.start_pipe(|messages| {
+                let mut stmt_cache = self.inner.cache_statement.lock();
 
                 while let Some(stmt) = stmt_cache.remove_lru() {
                     let statement_id = match stmt {

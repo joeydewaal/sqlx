@@ -41,7 +41,7 @@ async fn prepare(
         param_types.push(conn.resolve_type_id(&ty.0).await?);
     }
 
-    let mut manager = conn.pipe_message(|message| {
+    let mut manager = conn.start_pipe(|message| {
         message.write_msg(Parse {
             param_types: &param_types,
             query: sql,
@@ -123,15 +123,19 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-        if let Some(statement) = self.inner.stmt_cache.get(sql).await {
+        if let Some(statement) = self.inner.cache_statement.get(sql).await {
             return Ok(statement);
         }
 
         let statement = prepare(self, sql, parameters, metadata).await?;
 
         if store_to_cache {
-            if let Some((id, _)) = self.inner.stmt_cache.checked_insert(sql, statement.clone()) {
-                let mut manager = self.pipe_message(|message| {
+            if let Some((id, _)) = self
+                .inner
+                .cache_statement
+                .checked_insert(sql, statement.clone())
+            {
+                let mut manager = self.start_pipe(|message| {
                     message.write_msg(Close::Statement(id))?;
                     message.write_sync()
                 })?;
@@ -179,7 +183,7 @@ impl PgConnection {
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
 
-            let manager = self.pipe_message(|messages| {
+            let manager = self.start_pipe(|messages| {
                 // bind to attach the arguments to the statement and create a portal
                 messages.write_msg(Bind {
                     portal: PortalId::UNNAMED,
@@ -219,7 +223,7 @@ impl PgConnection {
             // prepared statements are binary
             (PgValueFormat::Binary, manager)
         } else {
-            let manager = self.pipe_message(|messages| {
+            let manager = self.start_pipe(|messages| {
                 messages.write_msg(Query(query))?;
                 // Query will trigger a ReadyForQuery
                 Ok(PipeUntil::ReadyForQuery)
