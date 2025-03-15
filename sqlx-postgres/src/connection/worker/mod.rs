@@ -60,6 +60,7 @@ impl Worker {
     }
 
     // Tries to receive the next message from the channel. Also handles termination if needed.
+    #[inline(always)]
     fn poll_next_request(&mut self, cx: &mut Context<'_>) -> Option<IoRequest> {
         // We only try to receive new messages if we are open.
         if self.state != WorkerState::Open {
