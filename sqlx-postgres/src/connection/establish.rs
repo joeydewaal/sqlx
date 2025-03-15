@@ -20,6 +20,9 @@ impl PgConnection {
 
         let mut conn = PgConnection::new(options, chan);
 
+        // To begin a session, a frontend opens a connection to the server
+        // and sends a startup message.
+
         let mut params = vec![
             // Sets the display format for date and time values,
             // as well as the rules for interpreting ambiguous date input values.
@@ -43,8 +46,6 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        // To begin a session, a frontend opens a connection to the server
-        // and sends a startup message.
         let mut manager = conn.pipe_once(Startup {
             username: Some(&options.username),
             database: options.database.as_deref(),
@@ -72,6 +73,7 @@ impl PgConnection {
                     Authentication::CleartextPassword => {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
+
                         manager = conn.pipe_msg_once(Password::Cleartext(
                             options.password.as_deref().unwrap_or_default(),
                         ))?;
@@ -81,6 +83,7 @@ impl PgConnection {
                         // password (with user name) encrypted via MD5, then encrypted again
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
+
                         manager = conn.pipe_msg_once(Password::Md5 {
                             username: &options.username,
                             password: options.password.as_deref().unwrap_or_default(),
@@ -113,6 +116,7 @@ impl PgConnection {
                 BackendMessageFormat::ReadyForQuery => {
                     // start-up is completed. The frontend can now issue commands
                     transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
+
                     break;
                 }
 

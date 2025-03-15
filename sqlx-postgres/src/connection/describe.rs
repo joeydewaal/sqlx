@@ -162,7 +162,7 @@ impl PgConnection {
         }
 
         // next we check a local cache for user-defined type names <-> object id
-        if let Some(info) = self.inner.type_cache.type_info_from_oid(&oid) {
+        if let Some(info) = self.inner.cache_type.type_info_from_oid(&oid) {
             return Ok(info.clone());
         }
 
@@ -173,7 +173,7 @@ impl PgConnection {
 
             // cache the type name <-> oid relationship in a paired hashmap
             // so we don't come down this road again
-            self.inner.type_cache.insert_type_info(oid, info.clone());
+            self.inner.cache_type.insert_type_info(oid, info.clone());
 
             Ok(info)
         } else {
@@ -358,7 +358,7 @@ WHERE rngtypid = $1
     }
 
     pub(crate) async fn fetch_type_id_by_name(&self, name: &str) -> Result<Oid, Error> {
-        if let Some(oid) = self.inner.type_cache.oid_by_name(name) {
+        if let Some(oid) = self.inner.cache_type.oid_by_name(name) {
             return Ok(oid);
         }
 
@@ -371,12 +371,12 @@ WHERE rngtypid = $1
                 type_name: name.into(),
             })?;
 
-        self.inner.type_cache.insert_named(name, oid);
+        self.inner.cache_type.insert_named(name, oid);
         Ok(oid)
     }
 
     pub(crate) async fn fetch_array_type_id(&self, array: &PgArrayOf) -> Result<Oid, Error> {
-        if let Some(oid) = self.inner.type_cache.array_oid_by_name(array) {
+        if let Some(oid) = self.inner.cache_type.array_oid_by_name(array) {
             return Ok(oid);
         }
 
@@ -391,7 +391,7 @@ WHERE rngtypid = $1
                 })?;
 
         self.inner
-            .type_cache
+            .cache_type
             .insert_array(array, elem_oid, array_oid);
         Ok(array_oid)
     }

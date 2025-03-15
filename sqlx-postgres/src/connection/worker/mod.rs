@@ -28,8 +28,8 @@ pub use message::{IoRequest, MessageBuf, PipeUntil};
 enum WorkerState {
     // The connection is open and in business.
     Open,
-    // Responding to last messages but not receiving new ones.
-    // Sending terminaate message and closing the socket.
+    // Responding to the last messages but not receiving new ones.
+    // Sent a terminate message and closing the socket.
     Closing,
     // Connection is fully closed.
     Closed,
@@ -87,6 +87,9 @@ impl Worker {
         // Try to receive a new io request from the channel.
         while let Some(msg) = self.poll_next_request(cx) {
             // Write the received message in the write buffer.
+            //
+            // TODO: This could grow the write buffer quite big when pipelining queries.
+            // There should be a mechanism that shrinks the buffer once in a while.
             self.conn.write_raw(&msg.data)?;
 
             // Ensure we flush the write buffer.
@@ -118,7 +121,8 @@ impl Worker {
                     Poll::Ready(response) => response?,
                     Poll::Pending => {
                         // Not ready for receiving messages.
-                        // Push front so this is the first message next time.
+                        // Push the message to the front so this is the first message on the next
+                        // poll.
                         self.back_log.push_front(msg);
                         return Poll::Pending;
                     }
@@ -139,7 +143,8 @@ impl Worker {
             }
         }
 
-        if self.back_log.is_empty() && self.state == WorkerState::Closing {
+        // Once the backlog is done and we sent out all the responses, were closing the socket.
+        if self.state == WorkerState::Closing && self.back_log.is_empty() {
             self.state = WorkerState::Closed;
             return self.conn.poll_shutdown(cx).map_err(Into::into);
         }
@@ -151,7 +156,7 @@ impl Worker {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<sqlx_core::Result<ReceivedMessage>> {
-        let x = self.conn.poll_try_read(cx, |buf| {
+        self.conn.poll_try_read(cx, |buf| {
             // all packets in postgres start with a 5-byte header
             // this header contains the message type and the total length of the message
             let Some(mut header) = buf.get(..5) else {
@@ -183,8 +188,7 @@ impl Worker {
             contents.advance(4);
 
             Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
-        });
-        x
+        })
     }
 
     #[inline(always)]
@@ -210,7 +214,7 @@ impl Future for Worker {
         // Flush the write buffer if needed.
         self.handle_poll_flush(cx)?;
 
-        // Try to receive responses for Postgres and send them back.
+        // Try to receive responses from the database and send them back.
         self.poll_backlog(cx)
     }
 }

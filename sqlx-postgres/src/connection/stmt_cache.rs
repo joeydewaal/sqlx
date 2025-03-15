@@ -37,7 +37,7 @@ impl SharedStatementCache {
         let mut this = self.lock();
         match this.get_mut(stmt) {
             Some(StatementStatus::InFlight { semaphore }) => {
-                semaphore.notify();
+                semaphore.notify_all();
                 let _ = this.remove(stmt);
             }
             _ => {}
@@ -65,7 +65,7 @@ impl SharedStatementCache {
                     this.insert(
                         stmt,
                         StatementStatus::InFlight {
-                            semaphore: Arc::new(Notify::new().notify_on_drop(true)),
+                            semaphore: Arc::new(Notify::new()),
                         },
                     );
                     return None;
@@ -73,7 +73,7 @@ impl SharedStatementCache {
             };
 
             if let Some(sem) = opt_semaphore {
-                let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.wait()).await;
+                let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.notified()).await;
                 if result.is_err() {}
             }
         }
@@ -105,7 +105,7 @@ impl SharedStatementCache {
                         metadata,
                     } => return Some((statement_id, metadata)),
                     StatementStatus::InFlight { semaphore } => {
-                        semaphore.notify();
+                        semaphore.notify_all();
                         return None;
                     }
                 }
