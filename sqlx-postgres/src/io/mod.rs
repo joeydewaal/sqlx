@@ -4,26 +4,8 @@ pub use buf_mut::PgBufMutExt;
 use std::fmt;
 use std::fmt::{Display, Formatter};
 use std::num::{NonZeroU32, Saturating};
-use std::sync::Mutex;
 
 pub(crate) use sqlx_core::io::*;
-
-// TODO: Should be an Atomic
-pub struct StatementIdManager(Mutex<StatementId>);
-
-impl StatementIdManager {
-    pub fn new(stmt: StatementId) -> Self {
-        Self(Mutex::new(stmt))
-    }
-
-    pub fn fetch_and_update(&self) -> StatementId {
-        let mut locked = self.0.lock().unwrap();
-        let current: StatementId = *locked;
-        *locked = locked.next();
-        drop(locked);
-        current
-    }
-}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct StatementId(IdInner);

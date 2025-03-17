@@ -11,7 +11,7 @@ use type_cache::TypeCache;
 use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 
 use crate::error::Error;
-use crate::io::{StatementId, StatementIdManager};
+use crate::io::StatementId;
 use crate::message::{
     Close, EncodeMessage, FrontendMessage, Notification, Query, TransactionStatus,
 };
@@ -59,10 +59,6 @@ pub struct PgConnectionInner {
     #[allow(dead_code)]
     secret_key: u32,
 
-    // sequence of statement IDs for use in preparing statements
-    // in PostgreSQL, the statement is prepared to a user-supplied identifier
-    stmt_id_manager: StatementIdManager,
-
     // cache statement by query string to the id and columns
     cache_statement: SharedStatementCache,
 
@@ -72,6 +68,10 @@ pub struct PgConnectionInner {
 }
 
 pub(crate) struct PgSharedInner {
+    // sequence of statement IDs for use in preparing statements
+    // in PostgreSQL, the statement is prepared to a user-supplied identifier
+    next_statement_id: StatementId,
+
     pub(crate) parameter_statuses: BTreeMap<String, String>,
 
     pub(crate) server_version_num: Option<u32>,
@@ -182,6 +182,7 @@ impl PgConnection {
                 chan,
                 notifications: None,
                 shared_inner: PgSharedInner {
+                    next_statement_id: StatementId::NAMED_START,
                     parameter_statuses: BTreeMap::new(),
                     server_version_num: None,
                     transaction_status: TransactionStatus::Idle,
@@ -190,7 +191,6 @@ impl PgConnection {
                 .into(),
                 process_id: 0,
                 secret_key: 0,
-                stmt_id_manager: StatementIdManager::new(StatementId::NAMED_START),
                 cache_statement: SharedStatementCache::new(options.statement_cache_capacity),
                 cache_type: TypeCache::new(),
                 log_settings: options.log_settings.clone(),
