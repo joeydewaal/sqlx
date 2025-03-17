@@ -29,7 +29,11 @@ async fn prepare(
     parameters: &[PgTypeInfo],
     metadata: Option<Arc<PgStatementMetadata>>,
 ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-    let id = conn.inner.stmt_id_manager.fetch_and_update();
+    let id = conn.with_lock(|inner| {
+        let id = inner.next_statement_id;
+        inner.next_statement_id = id.next();
+        id
+    });
 
     // build a list of type OIDs to send to the database in the PARSE command
     // we have not yet started the query sequence, so we are *safe* to cleanly make
