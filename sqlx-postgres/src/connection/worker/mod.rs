@@ -66,6 +66,7 @@ impl Worker {
         if self.state != WorkerState::Open {
             return None;
         }
+
         match self.chan.poll_next_unpin(cx) {
             Poll::Pending => None,
             Poll::Ready(Some(request)) => Some(request),

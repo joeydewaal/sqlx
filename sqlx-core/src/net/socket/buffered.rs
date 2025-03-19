@@ -1,13 +1,12 @@
 use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
-use futures_util::FutureExt;
 use std::io::Write;
 use std::ops::ControlFlow;
 use std::task::{ready, Context, Poll};
 use std::{cmp, io};
 
-use crate::io::{AsyncRead, AsyncReadExt, ProtocolDecode, ProtocolEncode};
+use crate::io::{AsyncRead, ProtocolDecode, ProtocolEncode};
 
 // Tokio, async-std, and std all use this as the default capacity for their buffered I/O.
 const DEFAULT_BUF_SIZE: usize = 8192;
@@ -168,7 +167,7 @@ impl<S: Socket> BufferedSocket<S> {
 
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while !self.write_buf.is_empty() {
-            let written = ready!(self.socket.write(self.write_buf.get()).poll_unpin(cx))?;
+            let written = ready!(self.socket.poll_write(cx, self.write_buf.get()))?;
             self.write_buf.consume(written);
             self.write_buf.sanity_check();
         }
@@ -263,14 +262,8 @@ impl WriteBuffer {
     /// Read into the buffer from `source`, returning the number of bytes read.
     ///
     /// The buffer is automatically advanced by the number of bytes read.
-    pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> io::Result<usize> {
-        let read = match () {
-            // Tokio lets us read into the buffer without zeroing first
-            #[cfg(feature = "_rt-tokio")]
-            _ => source.read_buf(self.buf_mut()).await?,
-            #[cfg(not(feature = "_rt-tokio"))]
-            _ => source.read(self.init_remaining_mut()).await?,
-        };
+    pub async fn read_from(&mut self, source: impl AsyncRead + Unpin) -> io::Result<usize> {
+        let read = crate::io::read_from(source, self.buf_mut()).await?;
 
         if read > 0 {
             self.advance(read);

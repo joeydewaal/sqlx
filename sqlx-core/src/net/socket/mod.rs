@@ -55,6 +55,22 @@ pub trait Socket: Send + Sync + Unpin + 'static {
         Poll::Ready(Ok(0))
     }
 
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>>
+    where
+        Self: Sized,
+    {
+        while !buf.is_empty() {
+            match self.try_write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.poll_write_ready(cx))?;
+                }
+                ready => return Poll::Ready(ready),
+            }
+        }
+
+        Poll::Ready(Ok(0))
+    }
+
     fn write<'a>(&'a mut self, buf: &'a [u8]) -> Write<'a, Self>
     where
         Self: Sized,
