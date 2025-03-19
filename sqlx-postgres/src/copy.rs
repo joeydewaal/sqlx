@@ -5,10 +5,11 @@ use futures_core::future::BoxFuture;
 
 use futures_core::stream::BoxStream;
 use futures_core::Stream;
-use sqlx_core::bytes::Bytes;
+use sqlx_core::bytes::{BufMut, Bytes};
 use sqlx_core::ext::async_stream::TryAsyncStream;
+use sqlx_core::io::{AsyncRead, AsyncReadExt};
 
-use crate::connection::worker::ConnManager;
+use crate::connection::worker::{ConnManager, MessageBuf};
 use crate::connection::PgConnection;
 use crate::error::{Error, Result};
 use crate::message::{
@@ -226,34 +227,37 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// The runtime features _used_ to be mutually exclusive, but are no longer.
     /// If both `runtime-async-std` and `runtime-tokio` features are enabled, the Tokio version
     /// takes precedent.
-    // TODO: JoeydeWaal
-    // pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
-    //     let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
-    //     loop {
-    //         let buf = conn.inner.stream.write_buffer_mut();
+    pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
+        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
+        loop {
+            let mut buf = MessageBuf::new();
 
-    //         // Write the CopyData format code and reserve space for the length.
-    //         // This may end up sending an empty `CopyData` packet if, after this point,
-    //         // we get canceled or read 0 bytes, but that should be fine.
-    //         buf.put_slice(b"d\0\0\0\x04");
+            // Write the CopyData format code and reserve space for the length.
+            // This may end up sending an empty `CopyData` packet if, after this point,
+            // we get canceled or read 0 bytes, but that should be fine.
+            buf.put_slice(b"d\0\0\0\x04");
 
-    //         let read = buf.read_from(&mut source).await?;
+            let read = buf.read_from(&mut source).await?;
 
-    //         if read == 0 {
-    //             break;
-    //         }
+            // Write the length
+            let read32 = i32::try_from(read)
+                .map_err(|_| err_protocol!("number of bytes read exceeds 2^31 - 1: {}", read))?;
 
-    //         // Write the length
-    //         let read32 = i32::try_from(read)
-    //             .map_err(|_| err_protocol!("number of bytes read exceeds 2^31 - 1: {}", read))?;
+            (&mut buf.get_mut()[1..]).put_i32(read32 + 4);
 
-    //         (&mut buf.get_mut()[1..]).put_i32(read32 + 4);
+            let (message, _) = buf.finish(PipeUntil::NumResponses(0));
+            conn.inner
+                .chan
+                .unbounded_send(message)
+                .map_err(|_| Error::WorkerCrashed)?;
 
-    //         conn.inner.stream.flush().await?;
-    //     }
+            if read == 0 {
+                break;
+            }
+        }
 
-    //     Ok(self)
-    // }
+        Ok(self)
+    }
 
     /// Signal that the `COPY` process should be aborted and any data received should be discarded.
     ///

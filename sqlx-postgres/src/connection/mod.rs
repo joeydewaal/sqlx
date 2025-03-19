@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
+use std::future::Future;
 use std::sync::Mutex;
 
 use futures_channel::mpsc::UnboundedSender;
@@ -142,12 +143,33 @@ impl PgConnection {
 
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
     /// the the condition of `PipeUntil` is met.
-    pub fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
+    pub(crate) fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
     where
         F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
     {
         let mut buffer = MessageBuf::new();
         let wait_type = (callback)(&mut buffer)?;
+        let (request, receiver) = buffer.finish(wait_type);
+        self.inner
+            .chan
+            .unbounded_send(request)
+            .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
+
+        Ok(ConnManager::new(receiver, &self))
+    }
+
+    /// Starts a temporary pipe to the background worker, the worker sends responses back until
+    /// the the condition of `PipeUntil` is met.
+    pub(crate) async fn start_pipe_async<'c, F, Fut>(
+        &'c self,
+        callback: F,
+    ) -> sqlx_core::Result<ConnManager<'c>>
+    where
+        F: FnOnce(&mut MessageBuf) -> Fut,
+        Fut: Future<Output = sqlx_core::Result<PipeUntil>>,
+    {
+        let mut buffer = MessageBuf::new();
+        let wait_type = (callback)(&mut buffer).await?;
         let (request, receiver) = buffer.finish(wait_type);
         self.inner
             .chan

@@ -1,5 +1,11 @@
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
-use sqlx_core::{io::ProtocolEncode, Error};
+use sqlx_core::{
+    bytes::BufMut,
+    io::{self, AsyncRead, AsyncReadExt, ProtocolEncode},
+    Error,
+};
+
+use std::io::Result as StdIoResult;
 
 use crate::message::{self, BackendMessageFormat, EncodeMessage, FrontendMessage, ReceivedMessage};
 
@@ -73,6 +79,34 @@ impl MessageBuf {
     #[inline(always)]
     pub(crate) fn write_msg(&mut self, message: impl FrontendMessage) -> Result<(), Error> {
         self.write(EncodeMessage(message))
+    }
+
+    pub(crate) fn put_slice(&mut self, src: &[u8]) {
+        self.data.put_slice(src);
+    }
+
+    pub(crate) fn init_remaining(&mut self) -> &mut [u8] {
+        self.data.resize(self.data.capacity(), 0);
+        &mut self.data
+    }
+
+    /// Read into the buffer from `source`, returning the number of bytes read.
+    ///
+    /// The buffer is automatically advanced by the number of bytes read.
+    pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> StdIoResult<usize> {
+        let read = match () {
+            // Tokio lets us read into the buffer without zeroing first
+            #[cfg(feature = "_rt-tokio")]
+            _ => source.read_buf(self.data.buf_mut()).await?,
+            #[cfg(not(feature = "_rt-tokio"))]
+            _ => source.read(self.init_remaining()).await?,
+        };
+
+        Ok(read)
+    }
+
+    pub fn get_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.data
     }
 
     pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {

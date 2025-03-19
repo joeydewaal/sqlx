@@ -24,3 +24,14 @@ pub use futures_util::io::AsyncReadExt;
 
 #[cfg(feature = "_rt-tokio")]
 pub use tokio::io::AsyncReadExt;
+
+#[cfg(feature = "_rt-tokio")]
+pub use tokio_util::codec::Decoder;
+
+#[cfg(not(feature = "_rt-tokio"))]
+pub use futures_codec::Decoder;
+#[cfg(feature = "_rt-tokio")]
+pub use tokio_util::codec::Framed;
+
+#[cfg(not(feature = "_rt-tokio"))]
+pub use futures_codec::Framed;
