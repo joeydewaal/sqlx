@@ -239,7 +239,6 @@ impl PgListener {
     /// ```rust,no_run
     /// # use sqlx::postgres::PgListener;
     /// #
-
     /// # sqlx::__rt::test_block_on(async move {
     /// # let mut listener = PgListener::connect("postgres:// ...").await?;
     /// loop {
@@ -267,7 +266,8 @@ impl PgListener {
 
         loop {
             let manager = match self.notif_buff {
-                Some(ref mut buff) => buff,
+                // If there isn't already a receiver we create a new one that waits for exactly one
+                // message. This is basically a oneshot channel.
                 None => {
                     let manager = self
                         .connection()
@@ -277,10 +277,11 @@ impl PgListener {
                     let chan = manager.into_inner().1;
                     self.notif_buff.insert(chan)
                 }
+                // If there is a receiver we use this because we haven't received the expected
+                // message.
+                Some(ref mut buff) => buff,
             };
 
-            // This should always get sent one message. If this future is cancelled the message is
-            // lost.
             let next_message = manager.next();
 
             let res = if let Some(ref mut close_event) = close_event {
@@ -291,10 +292,13 @@ impl PgListener {
                 next_message.await
             };
 
+            // Always remove the receiver, this either recevied a message and is not going to get a
+            // new one, the channel has closed or the pool is closed.
+            self.notif_buff.take();
+
             let Some(message) = res else {
                 return Ok(None);
             };
-            self.notif_buff.take();
 
             match message.format {
                 // We've received an async notification, return it.
