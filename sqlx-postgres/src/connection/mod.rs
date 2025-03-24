@@ -241,7 +241,7 @@ impl Connection for PgConnection {
         // connection and terminates.
 
         Box::pin(async move {
-            // Closing the channel makes the background worker to close the connection.
+            // Closing the channel makes the background worker close the connection.
             self.inner.chan.close_channel();
             Ok(())
         })
@@ -249,7 +249,7 @@ impl Connection for PgConnection {
 
     fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
-            // Closing the channel makes the background worker to close the connection.
+            // Closing the channel makes the background worker close the connection.
             self.inner.chan.close_channel();
             Ok(())
         })
