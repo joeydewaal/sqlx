@@ -1,124 +1,112 @@
-use std::{
-    sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
-};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use sqlx_core::{common::StatementCache, rt::Notify};
+use sqlx_core::{common::StatementCache, rt::Notify, Either};
 
 use super::{PgStatementMetadata, StatementId};
 
 #[derive(Clone)]
-pub enum StatementStatus {
-    Cached {
-        statement_id: StatementId,
-        metadata: Arc<PgStatementMetadata>,
-    },
-    InFlight {
-        semaphore: Arc<Notify>,
-    },
+pub enum StmtStatus {
+    Cached(StatementId, Arc<PgStatementMetadata>),
+    InFlight(Arc<Notify>),
 }
 
-pub struct SharedStatementCache {
-    inner: Mutex<StatementCache<StatementStatus>>,
+impl StmtStatus {
+    fn in_flight() -> Self {
+        StmtStatus::InFlight(Arc::new(Notify::new()))
+    }
 }
 
-impl SharedStatementCache {
+pub struct SharedStmtCache {
+    inner: Mutex<StatementCache<StmtStatus>>,
+}
+
+impl SharedStmtCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             inner: Mutex::new(StatementCache::new(capacity)),
         }
     }
 
-    pub fn lock<'c>(&'c self) -> MutexGuard<'c, StatementCache<StatementStatus>> {
-        self.inner.lock().expect("ERROR")
+    pub fn lock<'c>(&'c self) -> MutexGuard<'c, StatementCache<StmtStatus>> {
+        self.inner
+            .lock()
+            .expect("ERROR: failed to get statement cache lock")
     }
 
-    pub fn remove_notify(&self, stmt: &str) {
+    pub async fn get(
+        &self,
+        sql: &str,
+        store_to_cache: bool,
+    ) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
+        match self.get_or_in_flight(sql, store_to_cache) {
+            // We either got the statement cached and can use it or don't have it and are
+            // going to prepare it.
+            Either::Left(maybe_prepared) => maybe_prepared,
+            // The statement is being prepared.
+            Either::Right(wait_event) => {
+                // We wait for the statement to be prepared and try again.
+                wait_event.notified().await;
+                Box::pin(self.get(sql, store_to_cache)).await
+            }
+        }
+    }
+
+    fn get_or_in_flight(
+        &self,
+        sql: &str,
+        store_to_cache: bool,
+    ) -> Either<Option<(StatementId, Arc<PgStatementMetadata>)>, Arc<Notify>> {
         let mut this = self.lock();
-        match this.get_mut(stmt) {
-            Some(StatementStatus::InFlight { semaphore }) => {
-                semaphore.notify_all();
-                let _ = this.remove(stmt);
-            }
-            _ => {}
-        }
-    }
-
-    pub async fn get(&self, stmt: &str) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
-        for _ in 0..2 {
-            let opt_semaphore: Option<Arc<Notify>> = {
-                let mut this = self.lock();
-                if let Some(state) = this.get_mut(stmt).cloned() {
-                    match state {
-                        StatementStatus::InFlight { semaphore } => {
-                            let waiting = semaphore.clone();
-                            Some(waiting)
-                        }
-                        StatementStatus::Cached {
-                            statement_id,
-                            metadata,
-                        } => {
-                            return Some((statement_id, metadata));
-                        }
-                    }
-                } else {
-                    this.insert(
-                        stmt,
-                        StatementStatus::InFlight {
-                            semaphore: Arc::new(Notify::new()),
-                        },
-                    );
-                    return None;
+        match this.get_mut(sql).cloned() {
+            Some(StmtStatus::Cached(stmt, meta)) => return Either::Left(Some((stmt, meta))),
+            Some(StmtStatus::InFlight(wait_event)) => Either::Right(wait_event),
+            None => {
+                // If the query is not going to be stored in cache so we should not let other queries
+                // wait for this query to be done.
+                if store_to_cache {
+                    let _ = this.insert(sql, StmtStatus::in_flight());
                 }
-            };
 
-            if let Some(sem) = opt_semaphore {
-                let result = sqlx_core::rt::timeout(Duration::from_secs(2), sem.notified()).await;
-                if result.is_err() {}
+                Either::Left(None)
             }
         }
-        None
     }
 
     pub fn checked_insert(
         &self,
         sql: &str,
-        statement: (StatementId, Arc<PgStatementMetadata>),
+        (stmt, meta): (StatementId, Arc<PgStatementMetadata>),
     ) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
         let mut this = self.lock();
 
         if !this.is_enabled() {
-            None
-        } else {
-            let old = this.insert(
-                sql,
-                StatementStatus::Cached {
-                    statement_id: statement.0,
-                    metadata: statement.1,
-                },
-            );
+            return None;
+        }
 
-            if let Some(old) = old {
-                match old {
-                    StatementStatus::Cached {
-                        statement_id,
-                        metadata,
-                    } => return Some((statement_id, metadata)),
-                    StatementStatus::InFlight { semaphore } => {
-                        semaphore.notify_all();
-                        return None;
-                    }
-                }
-            } else {
+        match this.insert(sql, StmtStatus::Cached(stmt, meta)) {
+            Some(StmtStatus::InFlight(wait_event)) => {
+                // Once we're done preparing the statement and have inserted it in cache we can
+                // notify all tasks that are waiting.
+                wait_event.notify_all();
                 None
             }
+            Some(StmtStatus::Cached(stmt, meta)) => Some((stmt, meta)),
+            None => None,
+        }
+    }
+
+    pub fn remove_and_notify(&self, sql: &str) {
+        let mut this = self.lock();
+
+        if let Some(StmtStatus::InFlight(wait_event)) = this.remove(sql) {
+            wait_event.notify_all();
         }
     }
 
     pub fn cached_statements_size(&self) -> usize {
         let this = self.lock();
         this.iter()
-            .filter(|(_, v)| matches!(v, StatementStatus::Cached { .. }))
+            .filter(|(_, v)| matches!(v, StmtStatus::Cached { .. }))
             .count()
     }
 }

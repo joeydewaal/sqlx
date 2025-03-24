@@ -34,7 +34,10 @@ pub async fn read_from(
         #[cfg(feature = "_rt-tokio")]
         _ => source.read_buf(data).await?,
         #[cfg(not(feature = "_rt-tokio"))]
-        _ => source.read(self.init_remaining()).await?,
+        _ => {
+            data.resize(data.capacity(), 0);
+            source.read(data).await?
+        }
     };
 
     Ok(read)
