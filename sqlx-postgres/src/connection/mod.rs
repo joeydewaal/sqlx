@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
 use sqlx_core::io::ProtocolEncode;
-use stmt_cache::{SharedStatementCache, StatementStatus};
+use stmt_cache::{SharedStmtCache, StmtStatus};
 use type_cache::TypeCache;
 use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 
@@ -63,7 +63,7 @@ pub struct PgConnectionInner {
     secret_key: u32,
 
     // cache statement by query string to the id and columns
-    cache_statement: SharedStatementCache,
+    cache_statement: SharedStmtCache,
 
     cache_type: TypeCache,
 
@@ -216,7 +216,7 @@ impl PgConnection {
                 .into(),
                 process_id: 0,
                 secret_key: 0,
-                cache_statement: SharedStatementCache::new(options.statement_cache_capacity),
+                cache_statement: SharedStmtCache::new(options.statement_cache_capacity),
                 cache_type: TypeCache::new(),
                 log_settings: options.log_settings.clone(),
             }),
@@ -303,17 +303,10 @@ impl Connection for PgConnection {
                 let mut stmt_cache = self.inner.cache_statement.lock();
 
                 while let Some(stmt) = stmt_cache.remove_lru() {
-                    let statement_id = match stmt {
-                        StatementStatus::Cached {
-                            statement_id,
-                            metadata: _,
-                        } => statement_id,
-                        StatementStatus::InFlight { semaphore: _ } => {
-                            continue;
-                        }
-                    };
-                    messages.write_msg(Close::Statement(statement_id))?;
-                    cleared += 1;
+                    if let StmtStatus::Cached(stmt_id, _) = stmt {
+                        messages.write_msg(Close::Statement(stmt_id))?;
+                        cleared += 1;
+                    }
                 }
                 drop(stmt_cache);
 

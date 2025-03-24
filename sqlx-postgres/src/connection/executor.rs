@@ -127,11 +127,15 @@ impl PgConnection {
         // a statement object
         metadata: Option<Arc<PgStatementMetadata>>,
     ) -> Result<(StatementId, Arc<PgStatementMetadata>), Error> {
-        if let Some(statement) = self.inner.cache_statement.get(sql).await {
-            return Ok(statement);
+        if let Some(stmt) = self.inner.cache_statement.get(sql, store_to_cache).await {
+            return Ok(stmt);
         }
 
-        let statement = prepare(self, sql, parameters, metadata).await?;
+        let statement = prepare(self, sql, parameters, metadata)
+            .await
+            // If preparing the statement failed, we should update the status so it's not in flight
+            // anymore and also notify the waiting tasks.
+            .inspect_err(|_| self.inner.cache_statement.remove_and_notify(sql))?;
 
         if store_to_cache {
             if let Some((id, _)) = self
