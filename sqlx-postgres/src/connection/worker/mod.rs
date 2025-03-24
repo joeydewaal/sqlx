@@ -28,10 +28,10 @@ pub use message::{IoRequest, MessageBuf, PipeUntil};
 enum WorkerState {
     // The connection is open and in business.
     Open,
-    // Responding to the last messages but not receiving new ones.
-    // Sent a terminate message and closing the socket.
+    // Sent a [terminate] message but does not close the socket. Responding to the last messages
+    // but not receiving new ones.
     Closing,
-    // Connection is fully closed.
+    // The connection is terminated, this step closes the socket and stops the background task.
     Closed,
 }
 
@@ -71,11 +71,11 @@ impl Worker {
             Poll::Pending => None,
             Poll::Ready(Some(request)) => Some(request),
             Poll::Ready(None) => {
-                // Channel was closed, explicitly or because the connection was dropped. Either way
+                // Channel was closed, explicitly or because the sender was dropped. Either way
                 // we should start a gracefull shutdown.
                 self.conn
                     .write_raw(&[Terminate::FORMAT as u8, 0, 0, 0, 4])
-                    .unwrap();
+                    .expect("Terminate message should fit in buffer");
                 self.state = WorkerState::Closing;
                 self.should_flush = true;
                 None
@@ -133,7 +133,7 @@ impl Worker {
 
                 // Send the response back to the sender. We ignore the error because even if the
                 // sender is closed we should keep receiving responses from the database.
-                let _ = msg.chan.unbounded_send(response).is_err();
+                let _ = msg.chan.unbounded_send(response);
 
                 // See if we should keep sending responses back.
                 if msg.handle_done(format) {

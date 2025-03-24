@@ -8,10 +8,10 @@ use crate::{type_info::PgArrayOf, types::Oid, PgTypeInfo};
 ///
 /// TODO: This could be shared through `PgConnectOptions`.
 pub struct TypeCache {
-    inner: RwLock<TypeCacheMut>,
+    inner: RwLock<TypeCacheInner>,
 }
 
-struct TypeCacheMut {
+struct TypeCacheInner {
     // cache user-defined types by id <-> info
     cache_type_info: HashMap<Oid, PgTypeInfo>,
     cache_type_oid: HashMap<UStr, Oid>,
@@ -21,7 +21,7 @@ struct TypeCacheMut {
 impl TypeCache {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(TypeCacheMut {
+            inner: RwLock::new(TypeCacheInner {
                 cache_type_info: HashMap::new(),
                 cache_type_oid: HashMap::new(),
                 cache_elem_type_to_array: HashMap::new(),
@@ -29,12 +29,12 @@ impl TypeCache {
         }
     }
 
-    fn write<'a>(&'a self) -> RwLockWriteGuard<'a, TypeCacheMut> {
-        self.inner.write().expect("ERROR")
+    fn write<'a>(&'a self) -> RwLockWriteGuard<'a, TypeCacheInner> {
+        self.inner.write().expect("ERROR: failed to get write lock")
     }
 
-    fn read<'a>(&'a self) -> RwLockReadGuard<'a, TypeCacheMut> {
-        self.inner.read().expect("ERROR")
+    fn read<'a>(&'a self) -> RwLockReadGuard<'a, TypeCacheInner> {
+        self.inner.read().expect("ERROR: failed to get read lock")
     }
 
     pub fn clear_oid_cache(&self) {

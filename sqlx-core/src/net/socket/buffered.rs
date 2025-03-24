@@ -19,8 +19,8 @@ pub struct BufferedSocket<S> {
 
 pub struct WriteBuffer {
     buf: Vec<u8>,
-    pub bytes_written: usize,
-    pub bytes_flushed: usize,
+    bytes_written: usize,
+    bytes_flushed: usize,
 }
 
 pub struct ReadBuffer {
@@ -215,7 +215,7 @@ impl<S: Socket> BufferedSocket<S> {
 }
 
 impl WriteBuffer {
-    pub fn sanity_check(&self) {
+    fn sanity_check(&self) {
         assert_ne!(self.buf.capacity(), 0);
         assert!(self.bytes_written <= self.buf.len());
         assert!(self.bytes_flushed <= self.bytes_written);

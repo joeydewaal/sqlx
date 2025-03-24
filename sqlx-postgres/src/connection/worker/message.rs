@@ -44,7 +44,7 @@ impl IoRequest {
 
 /// TODO: We could share a `BytesMut` in the connection itself and use that as the backing buffer
 /// instead of allocating a `Vec` every time, but this requires the `ProtocolEncode` trait to be
-/// chanced.
+/// changed.
 pub struct MessageBuf {
     data: Vec<u8>,
 }
