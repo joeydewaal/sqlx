@@ -112,7 +112,7 @@ pub trait PgPoolCopyExt {
     fn copy_out_raw<'a>(
         &'a self,
         statement: &'a str,
-    ) -> BoxFuture<'a, Result<impl Stream<Item = Result<Bytes>> + Send + 'static>>;
+    ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>>;
 }
 
 impl PgPoolCopyExt for Pool<Postgres> {
@@ -126,7 +126,7 @@ impl PgPoolCopyExt for Pool<Postgres> {
     fn copy_out_raw<'a>(
         &'a self,
         statement: &'a str,
-    ) -> BoxFuture<'a, Result<impl Stream<Item = Result<Bytes>> + Send + 'static>> {
+    ) -> BoxFuture<'a, Result<BoxStream<'static, Result<Bytes>>>> {
         Box::pin(async { pg_begin_copy_out(self.acquire().await?, statement).await })
     }
 }
@@ -203,7 +203,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
-            let conn = self.conn.as_deref().expect("");
+            let conn = self.conn.as_deref().expect("send_data: conn taken");
             conn.start_pipe(|buff| {
                 buff.write_msg(CopyData(chunk))?;
                 Ok(PipeUntil::NumResponses(0))
