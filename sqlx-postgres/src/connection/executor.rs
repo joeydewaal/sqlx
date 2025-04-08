@@ -6,7 +6,7 @@ use crate::io::{PortalId, StatementId};
 use crate::logger::QueryLogger;
 use crate::message::{
     self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, ParameterDescription, Parse,
-    ParseComplete, Query, RowDescription,
+    ParseComplete, Query, ReadyForQuery, RowDescription,
 };
 use crate::statement::PgStatementMetadata;
 use crate::{
@@ -166,7 +166,9 @@ impl PgConnection {
 
         let mut metadata: Arc<PgStatementMetadata>;
 
-        let (format, mut manager) = if let Some(mut arguments) = arguments {
+        let mut manager;
+
+        let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
             //
             // Note: Postgres actually interprets this value as unsigned,
@@ -191,7 +193,7 @@ impl PgConnection {
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
 
-            let manager = self.start_pipe(|messages| {
+            manager = self.start_pipe(|messages| {
                 // bind to attach the arguments to the statement and create a portal
                 messages.write_msg(Bind {
                     portal: PortalId::UNNAMED,
@@ -229,9 +231,9 @@ impl PgConnection {
             })?;
 
             // prepared statements are binary
-            (PgValueFormat::Binary, manager)
+            PgValueFormat::Binary
         } else {
-            let manager = self.start_pipe(|messages| {
+            manager = self.start_pipe(|messages| {
                 messages.write_msg(Query(query))?;
                 // Query will trigger a ReadyForQuery
                 Ok(PipeUntil::ReadyForQuery)
@@ -241,7 +243,7 @@ impl PgConnection {
             metadata = Arc::new(PgStatementMetadata::default());
 
             // and unprepared statements are text
-            (PgValueFormat::Text, manager)
+            PgValueFormat::Text
         };
 
         Ok(try_stream! {
@@ -312,6 +314,8 @@ impl PgConnection {
 
                     BackendMessageFormat::ReadyForQuery => {
                         // processing of the query string is complete
+                        let rfq: ReadyForQuery = message.decode()?;
+                        self.set_transaction_status(rfq.transaction_status);
                         break;
                     }
 

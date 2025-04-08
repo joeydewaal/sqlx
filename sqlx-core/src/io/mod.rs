@@ -29,16 +29,14 @@ pub async fn read_from(
     mut source: impl AsyncRead + Unpin,
     data: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    let read = match () {
+    match () {
         // Tokio lets us read into the buffer without zeroing first
         #[cfg(feature = "_rt-tokio")]
-        _ => source.read_buf(data).await?,
+        _ => source.read_buf(data).await,
         #[cfg(not(feature = "_rt-tokio"))]
         _ => {
             data.resize(data.capacity(), 0);
-            source.read(data).await?
+            source.read(data).await
         }
-    };
-
-    Ok(read)
+    }
 }

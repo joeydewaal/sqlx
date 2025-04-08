@@ -311,7 +311,7 @@ impl Connection for PgConnection {
                 drop(stmt_cache);
 
                 if cleared > 0 {
-                    // Pipe messages until we receive a `ReadyForQuery` message.
+                    // Pipe messages until we receive a [ReadyForQuery] message.
                     messages.write_sync()
                 } else {
                     // This sends an empty message that waits for 0 responses.

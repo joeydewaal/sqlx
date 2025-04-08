@@ -4,7 +4,6 @@ use std::ops::{Deref, DerefMut};
 use futures_core::future::BoxFuture;
 
 use futures_core::stream::BoxStream;
-use futures_core::Stream;
 use sqlx_core::bytes::{BufMut, Bytes};
 use sqlx_core::ext::async_stream::TryAsyncStream;
 use sqlx_core::io::AsyncRead;
