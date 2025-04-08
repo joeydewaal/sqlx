@@ -38,7 +38,7 @@ impl TypeCache {
     }
 
     pub fn clear_oid_cache(&self) {
-        let mut this = self.inner.write().unwrap();
+        let mut this = self.write();
         this.cache_type_oid.clear();
     }
 

@@ -28,9 +28,8 @@ impl SharedStmtCache {
     }
 
     pub fn lock<'c>(&'c self) -> MutexGuard<'c, StatementCache<StmtStatus>> {
-        self.inner
-            .lock()
-            .expect("ERROR: failed to get statement cache lock")
+        const ERR_MSG: &'static str = "ERROR: failed to get statement cache lock";
+        self.inner.lock().expect(ERR_MSG)
     }
 
     pub async fn get(
@@ -38,7 +37,7 @@ impl SharedStmtCache {
         sql: &str,
         store_to_cache: bool,
     ) -> Option<(StatementId, Arc<PgStatementMetadata>)> {
-        match self.get_or_in_flight(sql, store_to_cache) {
+        match self.get_or_start_in_flight(sql, store_to_cache) {
             // We either got the statement cached and can use it or don't have it and are
             // going to prepare it.
             Either::Left(maybe_prepared) => maybe_prepared,
@@ -51,7 +50,7 @@ impl SharedStmtCache {
         }
     }
 
-    fn get_or_in_flight(
+    fn get_or_start_in_flight(
         &self,
         sql: &str,
         store_to_cache: bool,
@@ -61,7 +60,7 @@ impl SharedStmtCache {
             Some(StmtStatus::Cached(stmt, meta)) => return Either::Left(Some((stmt, meta))),
             Some(StmtStatus::InFlight(wait_event)) => Either::Right(wait_event),
             None => {
-                // If the query is not going to be stored in cache so we should not let other queries
+                // If the query is not going to be stored in cache so we shouldn't let other queries
                 // wait for this query to be done.
                 if store_to_cache {
                     let _ = this.insert(sql, StmtStatus::in_flight());
