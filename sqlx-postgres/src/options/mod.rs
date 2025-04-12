@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 
 pub use ssl_mode::PgSslMode;
 
-use crate::{connection::LogSettings, net::tls::CertificateInput};
+use crate::{
+    connection::{LogSettings, TypeCache},
+    net::tls::CertificateInput,
+};
 
 mod connect;
 mod parse;
@@ -30,6 +33,7 @@ pub struct PgConnectOptions {
     pub(crate) log_settings: LogSettings,
     pub(crate) extra_float_digits: Option<Cow<'static, str>>,
     pub(crate) options: Option<String>,
+    pub(crate) cached_types: TypeCache,
 }
 
 impl Default for PgConnectOptions {
@@ -90,6 +94,7 @@ impl PgConnectOptions {
             extra_float_digits: Some("2".into()),
             log_settings: Default::default(),
             options: var("PGOPTIONS").ok(),
+            cached_types: TypeCache::new(),
         }
     }
 

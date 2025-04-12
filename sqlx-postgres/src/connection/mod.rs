@@ -2,13 +2,11 @@ use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
-use crate::HashMap;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
 
 use crate::common::StatementCache;
 use crate::error::Error;
-use crate::ext::ustr::UStr;
 use crate::io::StatementId;
 use crate::message::{
     BackendMessageFormat, Close, Query, ReadyForQuery, ReceivedMessage, Terminate,
@@ -16,10 +14,10 @@ use crate::message::{
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
-use crate::types::Oid;
-use crate::{PgConnectOptions, PgTypeInfo, Postgres};
+use crate::{PgConnectOptions, Postgres};
 
 pub(crate) use sqlx_core::connection::*;
+pub(crate) use type_cache::TypeCache;
 
 pub use self::stream::PgStream;
 
@@ -29,6 +27,7 @@ mod executor;
 mod sasl;
 mod stream;
 mod tls;
+mod type_cache;
 
 /// A connection to a PostgreSQL database.
 ///
@@ -60,10 +59,8 @@ pub struct PgConnectionInner {
     // cache statement by query string to the id and columns
     cache_statement: StatementCache<(StatementId, Arc<PgStatementMetadata>)>,
 
-    // cache user-defined types by id <-> info
-    cache_type_info: HashMap<Oid, PgTypeInfo>,
-    cache_type_oid: HashMap<UStr, Oid>,
-    cache_elem_type_to_array: HashMap<Oid, Oid>,
+    // cache user-defined types
+    cached_types: TypeCache,
 
     // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,
@@ -208,7 +205,7 @@ impl Connection for PgConnection {
 
     fn clear_cached_statements(&mut self) -> BoxFuture<'_, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.cache_type_oid.clear();
+            self.inner.cached_types.clear_oid_cache();
 
             let mut cleared = 0_usize;
 
