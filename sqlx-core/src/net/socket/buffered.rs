@@ -1,7 +1,9 @@
 use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
+use std::io::Write;
 use std::ops::ControlFlow;
+use std::task::{ready, Context, Poll};
 use std::{cmp, io};
 
 use crate::io::{AsyncRead, AsyncReadExt, ProtocolDecode, ProtocolEncode};
@@ -54,6 +56,40 @@ impl<S: Socket> BufferedSocket<S> {
             })
         })
         .await
+    }
+
+    pub fn poll_read_buffered(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+    ) -> Poll<Result<BytesMut, Error>> {
+        self.poll_try_read(cx, |buf| {
+            Ok(if buf.len() < len {
+                ControlFlow::Continue(len)
+            } else {
+                ControlFlow::Break(buf.split_to(len))
+            })
+        })
+    }
+
+    pub fn poll_try_read<F, R>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut try_read: F,
+    ) -> Poll<crate::Result<R>>
+    where
+        F: FnMut(&mut BytesMut) -> Result<ControlFlow<R, usize>, Error>,
+    {
+        loop {
+            let read_len = match try_read(&mut self.read_buf.read)? {
+                ControlFlow::Continue(read_len) => read_len,
+                ControlFlow::Break(ret) => return Poll::Ready(Ok(ret)),
+            };
+
+            // FIXME: This is technically different from `async fn try_read` because the next poll it tries the
+            // `try_read` callback again.
+            ready!(self.read_buf.poll_read(cx, read_len, &mut self.socket))?;
+        }
     }
 
     /// Retryable read operation.
@@ -122,6 +158,16 @@ impl<S: Socket> BufferedSocket<S> {
         Ok(())
     }
 
+    #[inline(always)]
+    pub fn write_raw(&mut self, value: &[u8]) -> Result<(), Error> {
+        let buff = self.write_buffer_mut();
+
+        buff.buf_mut().write_all(value)?;
+        buff.bytes_written += value.len();
+        buff.sanity_check();
+        Ok(())
+    }
+
     pub async fn flush(&mut self) -> io::Result<()> {
         while !self.write_buf.is_empty() {
             let written = self.socket.write(self.write_buf.get()).await?;
@@ -134,9 +180,26 @@ impl<S: Socket> BufferedSocket<S> {
         Ok(())
     }
 
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // FIXME: This could be improved, this checks if the write buffer is empty on every poll.
+        while !self.write_buf.is_empty() {
+            let written = ready!(self.socket.poll_write(cx, self.write_buf.get()))?;
+            self.write_buf.consume(written);
+            self.write_buf.sanity_check();
+        }
+
+        self.socket.poll_flush(cx)
+    }
+
     pub async fn shutdown(&mut self) -> io::Result<()> {
         self.flush().await?;
         self.socket.shutdown().await
+    }
+
+    pub fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        // FIXME: this calls `poll_flush` on every poll.
+        ready!(self.poll_flush(cx)?);
+        self.socket.poll_shutdown(cx)
     }
 
     pub fn shrink_buffers(&mut self) {
@@ -298,6 +361,38 @@ impl ReadBuffer {
         }
 
         Ok(())
+    }
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+        socket: &mut impl Socket,
+    ) -> Poll<io::Result<()>> {
+        // FIXME: this could be improved because this tries to reserve the bytes on every poll.
+
+        // Because of how `BytesMut` works, we should only be shifting capacity back and forth
+        // between `read` and `available` unless we have to read an oversize message.
+        while self.read.len() < len {
+            self.reserve(len - self.read.len());
+
+            let read = ready!(socket.poll_read(cx, &mut self.available))?;
+
+            if read == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "expected to read {} bytes, got {} bytes at EOF",
+                        len,
+                        self.read.len()
+                    ),
+                )));
+            }
+
+            self.advance(read);
+        }
+
+        Poll::Ready(Ok(()))
     }
 
     fn reserve(&mut self, amt: usize) {
