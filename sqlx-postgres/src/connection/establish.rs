@@ -3,7 +3,7 @@ use crate::error::Error;
 use crate::message::{
     Authentication, BackendKeyData, BackendMessageFormat, Password, ReadyForQuery, Startup,
 };
-use crate::{PgConnectOptions, PgConnection};
+use crate::{PgConnectOptions, PgConnection, PipeUntil};
 
 use super::worker::Worker;
 
@@ -46,10 +46,13 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        let mut manager = conn.pipe_once(Startup {
-            username: Some(&options.username),
-            database: options.database.as_deref(),
-            params: &params,
+        let mut manager = conn.start_pipe(|buff| {
+            buff.write(Startup {
+                username: Some(&options.username),
+                database: options.database.as_deref(),
+                params: &params,
+            })?;
+            Ok(PipeUntil::ReadyForQuery)
         })?;
 
         // The server then uses this information and the contents of
@@ -74,7 +77,7 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        manager = conn.pipe_msg_once(Password::Cleartext(
+                        conn.pipe_msg_fire_and_forget(Password::Cleartext(
                             options.password.as_deref().unwrap_or_default(),
                         ))?;
                     }
@@ -84,7 +87,7 @@ impl PgConnection {
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
 
-                        manager = conn.pipe_msg_once(Password::Md5 {
+                        conn.pipe_msg_fire_and_forget(Password::Md5 {
                             username: &options.username,
                             password: options.password.as_deref().unwrap_or_default(),
                             salt: body.salt,
@@ -92,7 +95,7 @@ impl PgConnection {
                     }
 
                     Authentication::Sasl(body) => {
-                        manager = sasl::authenticate(&conn, options, body).await?;
+                        sasl::authenticate(&mut manager, &conn, options, body).await?;
                     }
 
                     method => {

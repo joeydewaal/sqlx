@@ -6,7 +6,6 @@ use std::sync::Mutex;
 
 use futures_channel::mpsc::UnboundedSender;
 use futures_core::future::BoxFuture;
-use sqlx_core::io::ProtocolEncode;
 use stmt_cache::{SharedStmtCache, StmtStatus};
 use type_cache::TypeCache;
 use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
@@ -121,26 +120,15 @@ impl PgConnection {
         self.with_lock(|inner| inner.transaction_status = status);
     }
 
-    /// This should generally not be used, see `PipeUntil::NumResponses` for more info.
-    pub(crate) fn pipe_msg_once<'c, 'en, T>(
-        &'c self,
-        value: T,
-    ) -> sqlx_core::Result<ConnManager<'c>>
+    pub(crate) fn pipe_msg_fire_and_forget<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<()>
     where
         T: FrontendMessage,
     {
-        self.pipe_once(EncodeMessage(value))
-    }
-
-    /// This should generally not be used, see `PipeUntil::NumResponses` for more info.
-    fn pipe_once<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<ConnManager<'c>>
-    where
-        T: ProtocolEncode<'en, ()>,
-    {
         self.start_pipe(|buf| {
-            buf.write(value)?;
-            Ok(PipeUntil::NumResponses(1))
-        })
+            buf.write(EncodeMessage(value))?;
+            Ok(PipeUntil::NumResponses(0))
+        })?;
+        Ok(())
     }
 
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
