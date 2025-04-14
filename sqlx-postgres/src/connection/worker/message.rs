@@ -13,10 +13,7 @@ pub enum PipeUntil {
     /// Worker waits until it received a [ReadyForQuery] response.
     ReadyForQuery,
     /// Worker waits until it received one of these responses.
-    Either {
-        left: BackendMessageFormat,
-        right: BackendMessageFormat,
-    },
+    RfqOr(BackendMessageFormat),
 }
 
 /// A request for the background worker.
@@ -37,7 +34,9 @@ impl IoRequest {
                 *num == 0
             }
             PipeUntil::ReadyForQuery => format == BackendMessageFormat::ReadyForQuery,
-            PipeUntil::Either { left, right } => left == format || right == format,
+            PipeUntil::RfqOr(wanted_msg) => {
+                wanted_msg == format || format == BackendMessageFormat::ReadyForQuery
+            }
         }
     }
 }

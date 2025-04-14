@@ -1183,6 +1183,23 @@ async fn test_pg_listener_implements_acquire() -> anyhow::Result<()> {
 }
 
 #[sqlx_macros::test]
+async fn test_pg_listener_can_be_canceled() -> anyhow::Result<()> {
+    let pool = pool::<Postgres>().await?;
+
+    // acquires and holds a connection which would normally prevent the pool from closing
+    let mut listener = PgListener::connect_with(&pool).await?;
+
+    let _ = sqlx_core::rt::timeout(Duration::from_nanos(1), listener.recv()).await;
+
+    let x: i32 = sqlx::query_scalar("select 1")
+        .fetch_one(&mut listener)
+        .await?;
+
+    assert!(x == 1);
+    Ok(())
+}
+
+#[sqlx_macros::test]
 async fn it_supports_domain_types_in_composite_domain_types() -> anyhow::Result<()> {
     // Only supported in Postgres 11+
     let conn = new::<Postgres>().await?;
