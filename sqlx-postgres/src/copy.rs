@@ -151,10 +151,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         let mut manager = conn.start_pipe(|buf| {
             buf.write_msg(Query(statement))?;
 
-            Ok(PipeUntil::Either {
-                left: BackendMessageFormat::CopyInResponse,
-                right: BackendMessageFormat::ReadyForQuery,
-            })
+            Ok(PipeUntil::RfqOr(BackendMessageFormat::CopyInResponse))
         })?;
 
         let response = match manager.recv_expect::<CopyInResponse>().await {
