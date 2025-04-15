@@ -8,7 +8,7 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_core::future::BoxFuture;
 use stmt_cache::{SharedStmtCache, StmtStatus};
 use type_cache::TypeCache;
-use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
+use worker::{IoRequest, MessageBuf, Pipe, PipeUntil};
 
 use crate::error::Error;
 use crate::io::StatementId;
@@ -97,7 +97,7 @@ impl PgConnection {
     ///
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
-    pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager, Error> {
+    pub(crate) fn queue_simple_query(&self, query: &str) -> sqlx_core::Result<Pipe<'_>> {
         self.start_pipe(|buf| {
             buf.write_msg(Query(query))?;
             Ok(PipeUntil::ReadyForQuery)
@@ -120,7 +120,7 @@ impl PgConnection {
         self.with_lock(|inner| inner.transaction_status = status);
     }
 
-    pub(crate) fn pipe_msg_fire_and_forget<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<()>
+    pub(crate) fn pipe_and_forget<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<()>
     where
         T: FrontendMessage,
     {
@@ -131,9 +131,9 @@ impl PgConnection {
         Ok(())
     }
 
-    // Schedules a notification to the background worker. Returns whether or not the background
-    // worker has crashed. No `ConnManager` is returned because the notifications are returned
-    // through the channel in the `PgConnection` itself.
+    // Make the background worker try and receive a notification, the receiver should only be
+    // dropped if the worker should stop trying to receive a notification. The notifications are
+    // returned through the channel in the `PgConnection` itself.
     pub(crate) fn schedule_notification(
         &self,
     ) -> sqlx_core::Result<UnboundedReceiver<ReceivedMessage>> {
@@ -148,7 +148,7 @@ impl PgConnection {
 
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
     /// the the condition of `PipeUntil` is met.
-    pub(crate) fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<ConnManager<'c>>
+    pub(crate) fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<Pipe<'c>>
     where
         F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<PipeUntil>,
     {
@@ -160,7 +160,7 @@ impl PgConnection {
             .unbounded_send(request)
             .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
 
-        Ok(ConnManager::new(receiver, &self))
+        Ok(Pipe::new(receiver, &self))
     }
 
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
@@ -169,7 +169,7 @@ impl PgConnection {
     pub(crate) async fn start_pipe_async<'c, F, Fut, R>(
         &'c self,
         callback: F,
-    ) -> sqlx_core::Result<(R, ConnManager<'c>)>
+    ) -> sqlx_core::Result<(R, Pipe<'c>)>
     where
         F: FnOnce(MessageBuf) -> Fut,
         Fut: Future<Output = sqlx_core::Result<(R, PipeUntil, MessageBuf)>>,
@@ -182,7 +182,7 @@ impl PgConnection {
             .unbounded_send(request)
             .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
 
-        Ok((r, ConnManager::new(receiver, &self)))
+        Ok((r, Pipe::new(receiver, &self)))
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
@@ -270,11 +270,11 @@ impl Connection for PgConnection {
         // self.execute("/* SQLx ping */").map_ok(|_| ()).boxed()
 
         Box::pin(async move {
-            let mut manager = self.start_pipe(|buf| {
+            let mut pipe = self.start_pipe(|buf| {
                 // The simplest call-and-response that's possible.
                 buf.write_sync()
             })?;
-            manager.recv_ready_for_query().await?;
+            pipe.recv_ready_for_query().await?;
             Ok(())
         })
     }
@@ -306,12 +306,12 @@ impl Connection for PgConnection {
 
             let mut cleared = 0_usize;
 
-            let mut manager = self.start_pipe(|messages| {
+            let mut pipe = self.start_pipe(|buf| {
                 let mut stmt_cache = self.inner.cache_statement.lock();
 
                 while let Some(stmt) = stmt_cache.remove_lru() {
                     if let StmtStatus::Cached(stmt_id, _) = stmt {
-                        messages.write_msg(Close::Statement(stmt_id))?;
+                        buf.write_msg(Close::Statement(stmt_id))?;
                         cleared += 1;
                     }
                 }
@@ -319,7 +319,7 @@ impl Connection for PgConnection {
 
                 if cleared > 0 {
                     // Pipe messages until we receive a [ReadyForQuery] message.
-                    messages.write_sync()
+                    buf.write_sync()
                 } else {
                     // This sends an empty message that waits for 0 responses.
                     Ok(PipeUntil::None)
@@ -327,8 +327,8 @@ impl Connection for PgConnection {
             })?;
 
             if cleared > 0 {
-                manager.wait_for_close_complete(cleared).await?;
-                manager.recv_ready_for_query().await?;
+                pipe.wait_for_close_complete(cleared).await?;
+                pipe.recv_ready_for_query().await?;
             }
             Ok(())
         })

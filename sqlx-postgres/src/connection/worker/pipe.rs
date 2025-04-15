@@ -12,16 +12,13 @@ use crate::{
     PgConnection, PgDatabaseError, PgSeverity,
 };
 
-pub struct ConnManager<'c> {
+pub struct Pipe<'c> {
     conn: &'c PgConnection,
     receiver: UnboundedReceiver<ReceivedMessage>,
 }
 
-impl<'c> ConnManager<'c> {
-    pub fn new(
-        receiver: UnboundedReceiver<ReceivedMessage>,
-        conn: &'c PgConnection,
-    ) -> ConnManager<'c> {
+impl<'c> Pipe<'c> {
+    pub fn new(receiver: UnboundedReceiver<ReceivedMessage>, conn: &'c PgConnection) -> Pipe<'c> {
         Self { receiver, conn }
     }
 
@@ -100,14 +97,6 @@ impl<'c> ConnManager<'c> {
                     return Err(message.decode::<PgDatabaseError>()?.into());
                 }
 
-                // BackendMessageFormat::NotificationResponse => {
-                //     if let Some(buffer) = &self.conn.inner.notifications {
-                //         let notification: Notification = message.decode()?;
-                //         let _ = buffer.unbounded_send(notification);
-
-                //         continue;
-                //     }
-                // }
                 BackendMessageFormat::ParameterStatus => {
                     // informs the frontend about the current (initial)
                     // setting of backend parameters

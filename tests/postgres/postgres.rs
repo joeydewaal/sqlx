@@ -1186,10 +1186,9 @@ async fn test_pg_listener_implements_acquire() -> anyhow::Result<()> {
 async fn test_pg_listener_can_be_canceled() -> anyhow::Result<()> {
     let pool = pool::<Postgres>().await?;
 
-    // acquires and holds a connection which would normally prevent the pool from closing
     let mut listener = PgListener::connect_with(&pool).await?;
 
-    let _ = sqlx_core::rt::timeout(Duration::from_nanos(1), listener.recv()).await;
+    let _ = sqlx_core::rt::timeout(Duration::from_millis(2), listener.recv()).await;
 
     let x: i32 = sqlx::query_scalar("select 1")
         .fetch_one(&mut listener)
@@ -2098,7 +2097,6 @@ async fn test_copy_in_error_case(query: &str, expected_error: &str) -> anyhow::R
         .fetch_one(&mut conn)
         .await?;
     assert_eq!(2i32, value);
-
     Ok(())
 }
 #[sqlx_macros::test]

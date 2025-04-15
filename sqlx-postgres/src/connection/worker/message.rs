@@ -64,13 +64,13 @@ impl MessageBuf {
         &mut self.data
     }
 
-    pub fn finish(self, ends_at: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
+    pub fn finish(self, pipe_until: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
         // We're using an unbounded channel here for sending responses back mostly for
         // convenience. Should this be changed to a bounded one?
         let (chan, receiver) = unbounded();
 
         let req = IoRequest {
-            pipe_until: ends_at,
+            pipe_until,
             data: self.data,
             chan,
         };

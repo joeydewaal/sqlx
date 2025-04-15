@@ -21,7 +21,7 @@ use sqlx_core::arguments::Arguments;
 use sqlx_core::Either;
 use std::{borrow::Cow, pin::pin, sync::Arc};
 
-use super::worker::ConnManager;
+use super::worker::Pipe;
 
 async fn prepare(
     conn: &PgConnection,
@@ -45,7 +45,7 @@ async fn prepare(
         param_types.push(conn.resolve_type_id(&ty.0).await?);
     }
 
-    let mut manager = conn.start_pipe(|message| {
+    let mut pipe = conn.start_pipe(|message| {
         message.write_msg(Parse {
             param_types: &param_types,
             query: sql,
@@ -61,21 +61,21 @@ async fn prepare(
     })?;
 
     // indicates that the SQL query string is now successfully parsed and has semantic validity
-    manager.recv_expect::<ParseComplete>().await?;
+    pipe.recv_expect::<ParseComplete>().await?;
 
     let metadata = if let Some(metadata) = metadata {
         // each SYNC produces one READY FOR QUERY
-        manager.recv_ready_for_query().await?;
+        pipe.recv_ready_for_query().await?;
 
         // we already have metadata
         metadata
     } else {
-        let parameters = recv_desc_params(&mut manager).await?;
+        let parameters = recv_desc_params(&mut pipe).await?;
 
-        let rows = recv_desc_rows(&mut manager).await?;
+        let rows = recv_desc_rows(&mut pipe).await?;
 
         // each SYNC produces one READY FOR QUERY
-        manager.recv_ready_for_query().await?;
+        pipe.recv_ready_for_query().await?;
 
         let parameters = conn.handle_parameter_description(parameters).await?;
 
@@ -91,11 +91,11 @@ async fn prepare(
     Ok((id, metadata))
 }
 
-async fn recv_desc_params(conn: &mut ConnManager<'_>) -> Result<ParameterDescription, Error> {
+async fn recv_desc_params(conn: &mut Pipe<'_>) -> Result<ParameterDescription, Error> {
     conn.recv_expect().await
 }
 
-async fn recv_desc_rows(conn: &mut ConnManager<'_>) -> Result<Option<RowDescription>, Error> {
+async fn recv_desc_rows(conn: &mut Pipe<'_>) -> Result<Option<RowDescription>, Error> {
     let rows: Option<RowDescription> = match conn.recv().await? {
         // describes the rows that will be returned when the statement is eventually executed
         message if message.format == BackendMessageFormat::RowDescription => {
@@ -143,12 +143,12 @@ impl PgConnection {
                 .cache_statement
                 .checked_insert(sql, statement.clone())
             {
-                let mut manager = self.start_pipe(|message| {
+                let mut pipe = self.start_pipe(|message| {
                     message.write_msg(Close::Statement(id))?;
                     message.write_sync()
                 })?;
-                manager.wait_for_close_complete(1).await?;
-                manager.recv_ready_for_query().await?;
+                pipe.wait_for_close_complete(1).await?;
+                pipe.recv_ready_for_query().await?;
             }
         }
 
@@ -166,7 +166,7 @@ impl PgConnection {
 
         let mut metadata: Arc<PgStatementMetadata>;
 
-        let mut manager;
+        let mut pipe;
 
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
@@ -193,7 +193,7 @@ impl PgConnection {
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
 
-            manager = self.start_pipe(|messages| {
+            pipe = self.start_pipe(|messages| {
                 // bind to attach the arguments to the statement and create a portal
                 messages.write_msg(Bind {
                     portal: PortalId::UNNAMED,
@@ -233,7 +233,7 @@ impl PgConnection {
             // prepared statements are binary
             PgValueFormat::Binary
         } else {
-            manager = self.start_pipe(|messages| {
+            pipe = self.start_pipe(|messages| {
                 messages.write_msg(Query(query))?;
                 // Query will trigger a ReadyForQuery
                 Ok(PipeUntil::ReadyForQuery)
@@ -248,7 +248,7 @@ impl PgConnection {
 
         Ok(try_stream! {
             loop {
-                let message = manager.recv().await?;
+                let message = pipe.recv().await?;
 
                 match message.format {
                     BackendMessageFormat::BindComplete
@@ -437,7 +437,7 @@ impl<'c> Executor<'c> for &'c PgConnection {
     }
 }
 
-// We keep the Executor impl for &mut PgConnection here backwards compatibility.
+// We keep the Executor impl for &mut PgConnection here for backwards compatibility.
 impl<'c> Executor<'c> for &'c mut PgConnection {
     type Database = Postgres;
 

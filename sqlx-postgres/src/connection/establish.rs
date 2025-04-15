@@ -50,8 +50,8 @@ impl PgConnection {
             params.push(("options", options));
         }
 
-        let mut manager = conn.start_pipe(|buff| {
-            buff.write(Startup {
+        let mut pipe = conn.start_pipe(|buf| {
+            buf.write(Startup {
                 username: Some(&options.username),
                 database: options.database.as_deref(),
                 params: &params,
@@ -69,7 +69,7 @@ impl PgConnection {
         let transaction_status;
 
         loop {
-            let message = manager.recv().await?;
+            let message = pipe.recv().await?;
             match message.format {
                 BackendMessageFormat::Authentication => match message.decode()? {
                     Authentication::Ok => {
@@ -81,7 +81,7 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        conn.pipe_msg_fire_and_forget(Password::Cleartext(
+                        conn.pipe_and_forget(Password::Cleartext(
                             options.password.as_deref().unwrap_or_default(),
                         ))?;
                     }
@@ -91,7 +91,7 @@ impl PgConnection {
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
 
-                        conn.pipe_msg_fire_and_forget(Password::Md5 {
+                        conn.pipe_and_forget(Password::Md5 {
                             username: &options.username,
                             password: options.password.as_deref().unwrap_or_default(),
                             salt: body.salt,
@@ -99,7 +99,7 @@ impl PgConnection {
                     }
 
                     Authentication::Sasl(body) => {
-                        sasl::authenticate(&mut manager, &conn, options, body).await?;
+                        sasl::authenticate(&mut pipe, &conn, options, body).await?;
                     }
 
                     method => {

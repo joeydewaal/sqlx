@@ -18,17 +18,17 @@ use crate::message::{BackendMessageFormat, FrontendMessage, ReceivedMessage, Ter
 
 use super::PgStream;
 
-mod manager;
 mod message;
+mod pipe;
 
-pub use manager::ConnManager;
 pub use message::{IoRequest, MessageBuf, PipeUntil};
+pub use pipe::Pipe;
 
 #[derive(PartialEq)]
 enum WorkerState {
     // The connection is open and ready for business.
     Open,
-    // Sent/sending a [Terminate] message but does not close the socket. Responding to the last
+    // Sent/sending a [Terminate] message but did not close the socket. Responding to the last
     // messages but not receiving new ones.
     Closing,
     // The connection is terminated, this step closes the socket and stops the background task.
@@ -170,9 +170,15 @@ impl Worker {
                 let response = match self.poll_next_message(cx) {
                     Poll::Ready(response) => response?,
                     Poll::Pending => {
-                        // Not ready for receiving messages. Push the message to the front so this
-                        // is the first request on the next poll.
-                        self.back_log.push_front(msg);
+                        // We don't want to keep trying to receive a notification if the connection
+                        // doesn't want any.
+                        if !(matches!(msg.pipe_until, PipeUntil::Notification)
+                            && msg.chan.is_closed())
+                        {
+                            // Not ready for receiving messages. Push the message to the front so this
+                            // is the first request on the next poll.
+                            self.back_log.push_front(msg);
+                        }
                         return Poll::Pending;
                     }
                 };

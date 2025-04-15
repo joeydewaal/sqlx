@@ -8,7 +8,7 @@ use sqlx_core::bytes::{BufMut, Bytes};
 use sqlx_core::ext::async_stream::TryAsyncStream;
 use sqlx_core::io::AsyncRead;
 
-use crate::connection::worker::ConnManager;
+use crate::connection::worker::Pipe;
 use crate::connection::PgConnection;
 use crate::error::{Error, Result};
 use crate::message::{
@@ -142,30 +142,26 @@ pub const PG_COPY_MAX_DATA_LEN: usize = 0x3fffffff - 1 - 4;
 /// will return an error the next time it is used.
 #[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
 pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
-    conn: Option<C>,
+    conn: C,
     response: CopyResponseData,
 }
 
 impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     async fn begin(conn: C, statement: &str) -> Result<Self> {
-        let mut manager = conn.start_pipe(|buf| {
+        let mut pipe = conn.start_pipe(|buf| {
             buf.write_msg(Query(statement))?;
-
             Ok(PipeUntil::ReadyForQueryOrCopyIn)
         })?;
 
-        let response = match manager.recv_expect::<CopyInResponse>().await {
+        let response = match pipe.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
-                manager.recv_ready_for_query().await?;
+                pipe.recv_ready_for_query().await?;
                 return Err(e);
             }
         };
 
-        Ok(PgCopyIn {
-            conn: Some(conn),
-            response,
-        })
+        Ok(PgCopyIn { conn, response })
     }
 
     /// Returns `true` if Postgres is expecting data in text or CSV format.
@@ -199,11 +195,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
-            let conn = self.conn.as_deref().expect("send_data: conn taken");
-            conn.start_pipe(|buff| {
-                buff.write_msg(CopyData(chunk))?;
-                Ok(PipeUntil::None)
-            })?;
+            self.conn.pipe_and_forget(CopyData(chunk))?;
         }
 
         Ok(self)
@@ -224,9 +216,9 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If both `runtime-async-std` and `runtime-tokio` features are enabled, the Tokio version
     /// takes precedent.
     pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
-        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
         loop {
-            let (read, _) = conn
+            let (read, _) = self
+                .conn
                 .start_pipe_async(|mut buf| async {
                     let write_buf = buf.buf_mut();
 
@@ -262,17 +254,12 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The server is expected to respond with an error, so only _unexpected_ errors are returned.
     pub async fn abort(self, msg: impl Into<String>) -> Result<()> {
-        let conn = self
-            .conn
-            .as_deref()
-            .expect("PgCopyIn::fail_with: conn taken illegally");
-
-        let mut manager = conn.start_pipe(|buff| {
-            buff.write_msg(CopyFail::new(msg))?;
+        let mut pipe = self.conn.start_pipe(|buf| {
+            buf.write_msg(CopyFail::new(msg))?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
 
-        match manager.recv().await {
+        match pipe.recv().await {
             Ok(msg) => Err(err_protocol!(
                 "fail_with: expected ErrorResponse, got: {:?}",
                 msg.format
@@ -281,7 +268,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
                 match e.code() {
                     Some(Cow::Borrowed("57014")) => {
                         // postgres abort received error code
-                        manager.recv_ready_for_query().await?;
+                        pipe.recv_ready_for_query().await?;
                         Ok(())
                     }
                     _ => Err(Error::Database(e)),
@@ -295,25 +282,20 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(self) -> Result<u64> {
-        let conn = self
-            .conn
-            .as_deref()
-            .expect("CopyWriter::finish: conn taken illegally");
-
-        let mut manager = conn.start_pipe(|buff| {
-            buff.write_msg(CopyDone)?;
+        let mut pipe = self.conn.start_pipe(|buf| {
+            buf.write_msg(CopyDone)?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
 
-        let cc: CommandComplete = match manager.recv_expect().await {
+        let cc: CommandComplete = match pipe.recv_expect().await {
             Ok(cc) => cc,
             Err(e) => {
-                manager.recv_ready_for_query().await?;
+                pipe.recv_ready_for_query().await?;
                 return Err(e);
             }
         };
 
-        manager.recv_ready_for_query().await?;
+        pipe.recv_ready_for_query().await?;
 
         Ok(cc.rows_affected())
     }
@@ -321,16 +303,11 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 
 impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            let _ = conn
-                .start_pipe(|buf| {
-                    buf.write_msg(CopyFail::new(
-                        "PgCopyIn dropped without calling finish() or fail()",
-                    ))?;
-                    Ok(PipeUntil::None)
-                })
-                .expect("BUG: PgCopyIn abort message should not be too large");
-        }
+        self.conn
+            .pipe_and_forget(CopyFail::new(
+                "PgCopyIn dropped without calling finish() or fail()",
+            ))
+            .expect("BUG: PgCopyIn abort message should not be too large");
     }
 }
 
@@ -338,26 +315,26 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
     conn: C,
     statement: &str,
 ) -> Result<BoxStream<'c, Result<Bytes>>> {
-    let mut manager = conn.queue_simple_query(statement)?;
+    let mut pipe = conn.queue_simple_query(statement)?;
 
-    let _: CopyOutResponse = manager.recv_expect().await?;
+    let _: CopyOutResponse = pipe.recv_expect().await?;
 
-    let (_, chan) = manager.into_inner();
+    let (_, chan) = pipe.into_inner();
 
     let stream: TryAsyncStream<'c, Bytes> = try_stream! {
-        let mut manager = ConnManager::new(chan, &conn);
+        let mut pipe = Pipe::new(chan, &conn);
         loop {
-            match manager.recv().await {
+            match pipe.recv().await {
                 Err(e) => {
-                    manager.recv_expect::<ReadyForQuery>().await?;
+                    pipe.recv_expect::<ReadyForQuery>().await?;
                     return Err(e);
                 },
                 Ok(msg) => match msg.format {
                     BackendMessageFormat::CopyData => r#yield!(msg.decode::<CopyData<Bytes>>()?.0),
                     BackendMessageFormat::CopyDone => {
                         let _ = msg.decode::<CopyDone>()?;
-                        manager.recv_expect::<CommandComplete>().await?;
-                        manager.recv_expect::<ReadyForQuery>().await?;
+                        pipe.recv_expect::<CommandComplete>().await?;
+                        pipe.recv_expect::<ReadyForQuery>().await?;
                         return Ok(())
                     },
                     _ => return Err(err_protocol!("unexpected message format during copy out: {:?}", msg.format))
