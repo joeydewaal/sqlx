@@ -263,14 +263,14 @@ impl PgListener {
     pub async fn schedule_notif(
         &mut self,
     ) -> sqlx_core::Result<UnboundedReceiver<ReceivedMessage>> {
-        let has_crashed = self.connection.schedule_notification();
+        let result = self.connection.schedule_notification();
 
-        if has_crashed.is_err() {
+        if result.is_err() {
             // If the worker crashed make sure get a new connection.
             self.reconnect().await?;
             return self.connection.schedule_notification();
         } else {
-            return has_crashed;
+            return result;
         }
     }
 

@@ -100,14 +100,6 @@ impl<'c> ConnManager<'c> {
                     return Err(message.decode::<PgDatabaseError>()?.into());
                 }
 
-                // BackendMessageFormat::NotificationResponse => {
-                //     if let Some(buffer) = &self.conn.inner.notifications {
-                //         let notification: Notification = message.decode()?;
-                //         let _ = buffer.unbounded_send(notification);
-
-                //         continue;
-                //     }
-                // }
                 BackendMessageFormat::ParameterStatus => {
                     // informs the frontend about the current (initial)
                     // setting of backend parameters

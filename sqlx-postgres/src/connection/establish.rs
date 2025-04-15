@@ -81,7 +81,7 @@ impl PgConnection {
                         // The frontend must now send a [PasswordMessage] containing the
                         // password in clear-text form.
 
-                        conn.pipe_msg_fire_and_forget(Password::Cleartext(
+                        conn.pipe_and_forget(Password::Cleartext(
                             options.password.as_deref().unwrap_or_default(),
                         ))?;
                     }
@@ -91,7 +91,7 @@ impl PgConnection {
                         // using the 4-byte random salt specified in the
                         // [AuthenticationMD5Password] message.
 
-                        conn.pipe_msg_fire_and_forget(Password::Md5 {
+                        conn.pipe_and_forget(Password::Md5 {
                             username: &options.username,
                             password: options.password.as_deref().unwrap_or_default(),
                             salt: body.salt,

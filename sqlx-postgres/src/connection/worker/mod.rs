@@ -28,7 +28,7 @@ pub use message::{IoRequest, MessageBuf, PipeUntil};
 enum WorkerState {
     // The connection is open and ready for business.
     Open,
-    // Sent/sending a [Terminate] message but does not close the socket. Responding to the last
+    // Sent/sending a [Terminate] message but did not close the socket. Responding to the last
     // messages but not receiving new ones.
     Closing,
     // The connection is terminated, this step closes the socket and stops the background task.

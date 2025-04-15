@@ -95,7 +95,7 @@ impl PgConnection {
     ///
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
-    pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager, Error> {
+    pub(crate) fn queue_simple_query(&self, query: &str) -> Result<ConnManager<'_>, Error> {
         self.start_pipe(|buf| {
             buf.write_msg(Query(query))?;
             Ok(PipeUntil::ReadyForQuery)
@@ -118,7 +118,7 @@ impl PgConnection {
         self.with_lock(|inner| inner.transaction_status = status);
     }
 
-    pub(crate) fn pipe_msg_fire_and_forget<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<()>
+    pub(crate) fn pipe_and_forget<'c, 'en, T>(&'c self, value: T) -> sqlx_core::Result<()>
     where
         T: FrontendMessage,
     {

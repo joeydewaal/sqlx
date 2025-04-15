@@ -34,7 +34,6 @@ impl TransactionManager for PgTransactionManager {
             let mut manager = rollback.conn.queue_simple_query(&statement)?;
             manager.wait_ready_for_query().await?;
 
-            println!("{}", rollback.conn.in_transaction());
             if !rollback.conn.in_transaction() {
                 return Err(Error::BeginFailed);
             }

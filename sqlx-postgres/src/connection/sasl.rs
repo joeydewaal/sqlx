@@ -70,7 +70,7 @@ pub(crate) async fn authenticate(
 
     let client_first_message = format!("{GS2_HEADER}{client_first_message_bare}");
 
-    conn.pipe_msg_fire_and_forget(SaslInitialResponse {
+    conn.pipe_and_forget(SaslInitialResponse {
         response: &client_first_message,
         plus: false,
     })?;
@@ -144,7 +144,7 @@ pub(crate) async fn authenticate(
     let mut client_final_message = format!("{client_final_message_wo_proof},{CLIENT_PROOF_ATTR}=");
     BASE64_STANDARD.encode_string(client_proof, &mut client_final_message);
 
-    conn.pipe_msg_fire_and_forget(SaslResponse(&client_final_message))?;
+    conn.pipe_and_forget(SaslResponse(&client_final_message))?;
 
     let data = match manager.recv_expect().await? {
         Authentication::SaslFinal(data) => data,

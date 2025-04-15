@@ -142,7 +142,7 @@ pub const PG_COPY_MAX_DATA_LEN: usize = 0x3fffffff - 1 - 4;
 /// will return an error the next time it is used.
 #[must_use = "connection will error on next use if `.finish()` or `.abort()` is not called"]
 pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
-    conn: Option<C>,
+    conn: C,
     response: CopyResponseData,
 }
 
@@ -150,7 +150,6 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     async fn begin(conn: C, statement: &str) -> Result<Self> {
         let mut manager = conn.start_pipe(|buf| {
             buf.write_msg(Query(statement))?;
-
             Ok(PipeUntil::ReadyForQueryOrCopyIn)
         })?;
 
@@ -162,10 +161,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
             }
         };
 
-        Ok(PgCopyIn {
-            conn: Some(conn),
-            response,
-        })
+        Ok(PgCopyIn { conn, response })
     }
 
     /// Returns `true` if Postgres is expecting data in text or CSV format.
@@ -199,11 +195,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If you're copying data from an `AsyncRead`, maybe consider [Self::read_from] instead.
     pub async fn send(&mut self, data: impl Deref<Target = [u8]>) -> Result<&mut Self> {
         for chunk in data.deref().chunks(PG_COPY_MAX_DATA_LEN) {
-            let conn = self.conn.as_deref().expect("send_data: conn taken");
-            conn.start_pipe(|buff| {
-                buff.write_msg(CopyData(chunk))?;
-                Ok(PipeUntil::None)
-            })?;
+            self.conn.pipe_and_forget(CopyData(chunk))?;
         }
 
         Ok(self)
@@ -224,9 +216,9 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     /// If both `runtime-async-std` and `runtime-tokio` features are enabled, the Tokio version
     /// takes precedent.
     pub async fn read_from(&mut self, mut source: impl AsyncRead + Unpin) -> Result<&mut Self> {
-        let conn: &mut PgConnection = self.conn.as_deref_mut().expect("copy_from: conn taken");
         loop {
-            let (read, _) = conn
+            let (read, _) = self
+                .conn
                 .start_pipe_async(|mut buf| async {
                     let write_buf = buf.buf_mut();
 
@@ -262,12 +254,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The server is expected to respond with an error, so only _unexpected_ errors are returned.
     pub async fn abort(self, msg: impl Into<String>) -> Result<()> {
-        let conn = self
-            .conn
-            .as_deref()
-            .expect("PgCopyIn::fail_with: conn taken illegally");
-
-        let mut manager = conn.start_pipe(|buff| {
+        let mut manager = self.conn.start_pipe(|buff| {
             buff.write_msg(CopyFail::new(msg))?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
@@ -295,12 +282,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     ///
     /// The number of rows affected is returned.
     pub async fn finish(self) -> Result<u64> {
-        let conn = self
-            .conn
-            .as_deref()
-            .expect("CopyWriter::finish: conn taken illegally");
-
-        let mut manager = conn.start_pipe(|buff| {
+        let mut manager = self.conn.start_pipe(|buff| {
             buff.write_msg(CopyDone)?;
             Ok(PipeUntil::ReadyForQuery)
         })?;
@@ -321,16 +303,11 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 
 impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
     fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            let _ = conn
-                .start_pipe(|buf| {
-                    buf.write_msg(CopyFail::new(
-                        "PgCopyIn dropped without calling finish() or fail()",
-                    ))?;
-                    Ok(PipeUntil::None)
-                })
-                .expect("BUG: PgCopyIn abort message should not be too large");
-        }
+        self.conn
+            .pipe_and_forget(CopyFail::new(
+                "PgCopyIn dropped without calling finish() or fail()",
+            ))
+            .expect("BUG: PgCopyIn abort message should not be too large");
     }
 }
 
