@@ -4,7 +4,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::sync::Mutex;
 
-use futures_channel::mpsc::UnboundedSender;
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures_core::future::BoxFuture;
 use stmt_cache::{SharedStmtCache, StmtStatus};
 use type_cache::TypeCache;
@@ -13,7 +13,7 @@ use worker::{ConnManager, IoRequest, MessageBuf, PipeUntil};
 use crate::error::Error;
 use crate::io::StatementId;
 use crate::message::{
-    Close, EncodeMessage, FrontendMessage, Notification, Query, TransactionStatus,
+    Close, EncodeMessage, FrontendMessage, Query, ReceivedMessage, TransactionStatus,
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
@@ -47,7 +47,7 @@ pub struct PgConnectionInner {
     // buffer of unreceived notification messages from `PUBLISH`
     // this is set when creating a PgListener and only written to if that listener is
     // re-used for query execution in-between receiving messages
-    pub(crate) notifications: Option<UnboundedSender<Notification>>,
+    pub(crate) notifications: UnboundedReceiver<ReceivedMessage>,
 
     shared_inner: Mutex<PgSharedInner>,
 
@@ -126,9 +126,24 @@ impl PgConnection {
     {
         self.start_pipe(|buf| {
             buf.write(EncodeMessage(value))?;
-            Ok(PipeUntil::NumResponses(0))
+            Ok(PipeUntil::None)
         })?;
         Ok(())
+    }
+
+    // Schedules a notification to the background worker. Returns whether or not the background
+    // worker has crashed. No `ConnManager` is returned because the notifications are returned
+    // through the channel in the `PgConnection` itself.
+    pub(crate) fn schedule_notification(
+        &self,
+    ) -> sqlx_core::Result<UnboundedReceiver<ReceivedMessage>> {
+        let notif = MessageBuf::new();
+        let (request, chan) = notif.finish(PipeUntil::Notification);
+        self.inner
+            .chan
+            .unbounded_send(request)
+            .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
+        Ok(chan)
     }
 
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
@@ -189,11 +204,15 @@ impl PgConnection {
         callback(&mut locked)
     }
 
-    fn new(options: &PgConnectOptions, chan: UnboundedSender<IoRequest>) -> Self {
+    fn new(
+        options: &PgConnectOptions,
+        chan: UnboundedSender<IoRequest>,
+        notifications: UnboundedReceiver<ReceivedMessage>,
+    ) -> Self {
         Self {
             inner: Box::new(PgConnectionInner {
                 chan,
-                notifications: None,
+                notifications,
                 shared_inner: PgSharedInner {
                     next_statement_id: StatementId::NAMED_START,
                     parameter_statuses: BTreeMap::new(),
@@ -303,7 +322,7 @@ impl Connection for PgConnection {
                     messages.write_sync()
                 } else {
                     // This sends an empty message that waits for 0 responses.
-                    Ok(PipeUntil::NumResponses(0))
+                    Ok(PipeUntil::None)
                 }
             })?;
 

@@ -6,7 +6,7 @@ use sqlx_core::Error;
 use crate::{
     connection::stream::parse_server_version,
     message::{
-        BackendMessage, BackendMessageFormat, Notice, Notification, ParameterStatus, ReadyForQuery,
+        BackendMessage, BackendMessageFormat, Notice, ParameterStatus, ReadyForQuery,
         ReceivedMessage,
     },
     PgConnection, PgDatabaseError, PgSeverity,
@@ -100,15 +100,14 @@ impl<'c> ConnManager<'c> {
                     return Err(message.decode::<PgDatabaseError>()?.into());
                 }
 
-                BackendMessageFormat::NotificationResponse => {
-                    if let Some(buffer) = &self.conn.inner.notifications {
-                        let notification: Notification = message.decode()?;
-                        let _ = buffer.unbounded_send(notification);
+                // BackendMessageFormat::NotificationResponse => {
+                //     if let Some(buffer) = &self.conn.inner.notifications {
+                //         let notification: Notification = message.decode()?;
+                //         let _ = buffer.unbounded_send(notification);
 
-                        continue;
-                    }
-                }
-
+                //         continue;
+                //     }
+                // }
                 BackendMessageFormat::ParameterStatus => {
                     // informs the frontend about the current (initial)
                     // setting of backend parameters

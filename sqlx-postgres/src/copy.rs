@@ -151,7 +151,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
         let mut manager = conn.start_pipe(|buf| {
             buf.write_msg(Query(statement))?;
 
-            Ok(PipeUntil::RfqOr(BackendMessageFormat::CopyInResponse))
+            Ok(PipeUntil::ReadyForQueryOrCopyIn)
         })?;
 
         let response = match manager.recv_expect::<CopyInResponse>().await {
@@ -202,7 +202,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
             let conn = self.conn.as_deref().expect("send_data: conn taken");
             conn.start_pipe(|buff| {
                 buff.write_msg(CopyData(chunk))?;
-                Ok(PipeUntil::NumResponses(0))
+                Ok(PipeUntil::None)
             })?;
         }
 
@@ -244,7 +244,7 @@ impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
 
                     (&mut write_buf[1..]).put_i32(read32 + 4);
 
-                    Ok((read32, PipeUntil::NumResponses(0), buf))
+                    Ok((read32, PipeUntil::None, buf))
                 })
                 .await?;
 
@@ -327,7 +327,7 @@ impl<C: DerefMut<Target = PgConnection>> Drop for PgCopyIn<C> {
                     buf.write_msg(CopyFail::new(
                         "PgCopyIn dropped without calling finish() or fail()",
                     ))?;
-                    Ok(PipeUntil::NumResponses(0))
+                    Ok(PipeUntil::None)
                 })
                 .expect("BUG: PgCopyIn abort message should not be too large");
         }

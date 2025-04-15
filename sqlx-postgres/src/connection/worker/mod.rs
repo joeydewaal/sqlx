@@ -26,10 +26,10 @@ pub use message::{IoRequest, MessageBuf, PipeUntil};
 
 #[derive(PartialEq)]
 enum WorkerState {
-    // The connection is open and in business.
+    // The connection is open and ready for business.
     Open,
-    // Sent a [terminate] message but does not close the socket. Responding to the last messages
-    // but not receiving new ones.
+    // Sent/sending a [Terminate] message but does not close the socket. Responding to the last
+    // messages but not receiving new ones.
     Closing,
     // The connection is terminated, this step closes the socket and stops the background task.
     Closed,
@@ -39,12 +39,20 @@ pub struct Worker {
     state: WorkerState,
     should_flush: bool,
     chan: UnboundedReceiver<IoRequest>,
+    // Holds the requests from the `PgConnection` that still need a response.
     back_log: VecDeque<IoRequest>,
-    conn: BufferedSocket<Box<dyn Socket>>,
+    socket: BufferedSocket<Box<dyn Socket>>,
+    // A channel that is used to send asynchronous notifications back to the `PgConnection` struct.
+    notif_chan: UnboundedSender<ReceivedMessage>,
+    // Buffered responses that we couldn't handle
+    buffered_msg: VecDeque<ReceivedMessage>,
 }
 
 impl Worker {
-    pub fn spawn(stream: PgStream) -> UnboundedSender<IoRequest> {
+    pub fn spawn(
+        stream: PgStream,
+        notif_chan: UnboundedSender<ReceivedMessage>,
+    ) -> UnboundedSender<IoRequest> {
         let (tx, rx) = unbounded();
 
         let conn = Worker {
@@ -52,7 +60,9 @@ impl Worker {
             should_flush: false,
             chan: rx,
             back_log: VecDeque::new(),
-            conn: stream.inner,
+            socket: stream.inner,
+            notif_chan,
+            buffered_msg: VecDeque::new(),
         };
 
         spawn(conn);
@@ -73,9 +83,10 @@ impl Worker {
             Poll::Ready(None) => {
                 // Channel was closed, explicitly or because the sender was dropped. Either way
                 // we should start a gracefull shutdown.
-                self.conn
+                self.socket
                     .write_raw(&[Terminate::FORMAT as u8, 0, 0, 0, 4])
                     .expect("Terminate message should fit in buffer");
+
                 self.state = WorkerState::Closing;
                 self.should_flush = true;
                 None
@@ -91,13 +102,13 @@ impl Worker {
             //
             // TODO: This could grow the write buffer quite big when pipelining queries.
             // There should be a mechanism that shrinks the buffer once in a while.
-            self.conn.write_raw(&msg.data)?;
+            self.socket.write_raw(&msg.data)?;
 
             // Ensure we flush the write buffer.
             self.should_flush = true;
 
-            // Only put the message in the write buffer if we need to respond.
-            if !matches!(msg.send_until, PipeUntil::NumResponses(0)) {
+            // Only wait for a response if we're expecting one.
+            if !matches!(msg.pipe_until, PipeUntil::None) {
                 self.back_log.push_back(msg);
             }
         }
@@ -107,7 +118,7 @@ impl Worker {
     #[inline(always)]
     fn handle_poll_flush(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
         if self.should_flush {
-            if let Poll::Ready(_) = self.conn.poll_flush(cx) {
+            if let Poll::Ready(_) = self.socket.poll_flush(cx) {
                 self.should_flush = false;
             }
         }
@@ -115,30 +126,59 @@ impl Worker {
     }
 
     #[inline(always)]
+    fn handle_response_and_done(&mut self, msg: &IoRequest, response: ReceivedMessage) -> bool {
+        let format = response.format;
+
+        // Filter out notifications.
+        if format == BackendMessageFormat::NotificationResponse {
+            let _ = self.notif_chan.unbounded_send(response);
+            // We're only ready here if we actually want a [NotificationResponse].
+            return matches!(msg.pipe_until, PipeUntil::Notification);
+        }
+
+        match msg.pipe_until {
+            PipeUntil::None => unreachable!("We should never send a response back."),
+            PipeUntil::ReadyForQuery => {
+                let _ = msg.chan.unbounded_send(response);
+
+                format == BackendMessageFormat::ReadyForQuery
+            }
+            PipeUntil::ReadyForQueryOrCopyIn => {
+                let _ = msg.chan.unbounded_send(response);
+
+                format == BackendMessageFormat::ReadyForQuery
+                    || format == BackendMessageFormat::CopyInResponse
+            }
+            PipeUntil::Notification => {
+                // All the notifications are already filtered out, we only get other responses that
+                // we don't want. Make sure we store them in the buffer so we don't lose them.
+                let _ = self.buffered_msg.push_back(response);
+
+                // When the channel is closed it means the `Future` of `PgListener::try_next` (or
+                // `PgListener::try_next`) has been dropped, we shouldn't try to receive a
+                // notification again.
+                msg.chan.is_closed()
+            }
+        }
+    }
+
+    #[inline(always)]
     fn poll_backlog(&mut self, cx: &mut Context<'_>) -> Poll<sqlx_core::Result<()>> {
-        while let Some(mut msg) = self.back_log.pop_front() {
+        while let Some(msg) = self.back_log.pop_front() {
             loop {
+                // Try and get a response, these could be buffered or _fresh_.
                 let response = match self.poll_next_message(cx) {
                     Poll::Ready(response) => response?,
                     Poll::Pending => {
-                        // Not ready for receiving messages.
-                        // Push the message to the front so this is the first message on the next
-                        // poll.
+                        // Not ready for receiving messages. Push the message to the front so this
+                        // is the first request on the next poll.
                         self.back_log.push_front(msg);
                         return Poll::Pending;
                     }
                 };
 
-                let format = response.format;
-
-                // Send the response back to the sender. We ignore the error because even if the
-                // sender is closed we should keep receiving responses from the database.
-                let _ = msg.chan.unbounded_send(response);
-
-                // See if we should keep sending responses back.
-                if msg.handle_done(format) {
-                    // Remove the received message and move on to the next one.
-                    drop(msg);
+                if self.handle_response_and_done(&msg, response) {
+                    // We're done handling this message, move on to the next.
                     break;
                 }
             }
@@ -147,7 +187,7 @@ impl Worker {
         // Once the backlog is done and we sent out all the responses, were closing the socket.
         if self.state == WorkerState::Closing && self.back_log.is_empty() {
             self.state = WorkerState::Closed;
-            return self.conn.poll_shutdown(cx).map_err(Into::into);
+            return self.socket.poll_shutdown(cx).map_err(Into::into);
         }
         Poll::Pending
     }
@@ -157,7 +197,12 @@ impl Worker {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<sqlx_core::Result<ReceivedMessage>> {
-        self.conn.poll_try_read(cx, |buf| {
+        // Try and get a buffered message first.
+        if let Some(buffered) = self.buffered_msg.pop_front() {
+            return Poll::Ready(Ok(buffered));
+        }
+
+        self.socket.poll_try_read(cx, |buf| {
             // all packets in postgres start with a 5-byte header
             // this header contains the message type and the total length of the message
             let Some(mut header) = buf.get(..5) else {
@@ -195,7 +240,8 @@ impl Worker {
     #[inline(always)]
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
         if self.state == WorkerState::Closed {
-            self.conn.poll_shutdown(cx)
+            // The buffer is closed, a [Terminate] message has been sent, now try and close the socket.
+            self.socket.poll_shutdown(cx)
         } else {
             Poll::Ready(Ok(()))
         }
@@ -209,13 +255,13 @@ impl Future for Worker {
         // Only poll the future if we're not closed/closing.
         ready!(self.poll_shutdown(cx)?);
 
-        // Push as many new messages in the write buffer as we can.
+        // Push as many new requests in the write buffer as we can.
         self.poll_receiver(cx)?;
 
         // Flush the write buffer if needed.
         self.handle_poll_flush(cx)?;
 
-        // Try to receive responses from the database and send them back.
+        // Try to receive responses from the database and handle them.
         self.poll_backlog(cx)
     }
 }
