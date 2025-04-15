@@ -1,3 +1,5 @@
+use futures_channel::mpsc::unbounded;
+
 use crate::connection::{sasl, stream::PgStream};
 use crate::error::Error;
 use crate::message::{
@@ -15,10 +17,12 @@ impl PgConnection {
         // Upgrade to TLS if we were asked to and the server supports it
         let stream_bg = PgStream::connect(options).await?;
 
-        // Spawn the background worker.
-        let chan = Worker::spawn(stream_bg);
+        let (tx, rx) = unbounded();
 
-        let mut conn = PgConnection::new(options, chan);
+        // Spawn the background worker.
+        let chan = Worker::spawn(stream_bg, tx);
+
+        let mut conn = PgConnection::new(options, chan, rx);
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
