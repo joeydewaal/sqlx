@@ -1,3 +1,5 @@
+use std::task::{ready, Context, Poll};
+
 use futures_channel::mpsc::UnboundedReceiver;
 use futures_util::StreamExt;
 use log::Level;
@@ -13,7 +15,7 @@ use crate::{
 };
 
 pub struct Pipe<'c> {
-    conn: &'c PgConnection,
+    pub conn: &'c PgConnection,
     receiver: UnboundedReceiver<ReceivedMessage>,
 }
 
@@ -156,6 +158,83 @@ impl<'c> Pipe<'c> {
             }
 
             return Ok(message);
+        }
+    }
+
+    // Get the next message from the server
+    // May wait for more data from the server
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<ReceivedMessage, Error>> {
+        loop {
+            let message =
+                ready!(self.receiver.poll_next_unpin(cx)).ok_or_else(|| Error::WorkerCrashed)?;
+            match message.format {
+                BackendMessageFormat::ErrorResponse => {
+                    // An error returned from the database server.
+                    return Poll::Ready(Err(message.decode::<PgDatabaseError>()?.into()));
+                }
+
+                BackendMessageFormat::ParameterStatus => {
+                    // informs the frontend about the current (initial)
+                    // setting of backend parameters
+
+                    let ParameterStatus { name, value } = message.decode()?;
+                    // TODO: handle `client_encoding`, `DateStyle` change
+
+                    match name.as_str() {
+                        "server_version" => {
+                            if let Some(version) = parse_server_version(&value) {
+                                self.conn.set_server_version_num(version);
+                            }
+                        }
+                        _ => {
+                            self.conn
+                                .with_lock(|inner| inner.parameter_statuses.insert(name, value));
+                        }
+                    }
+
+                    continue;
+                }
+
+                BackendMessageFormat::NoticeResponse => {
+                    // do we need this to be more configurable?
+                    // if you are reading this comment and think so, open an issue
+
+                    let notice: Notice = message.decode()?;
+                    let (log_level, tracing_level) = match notice.severity() {
+                        PgSeverity::Fatal | PgSeverity::Panic | PgSeverity::Error => {
+                            (Level::Error, tracing::Level::ERROR)
+                        }
+                        PgSeverity::Warning => (Level::Warn, tracing::Level::WARN),
+                        PgSeverity::Notice => (Level::Info, tracing::Level::INFO),
+                        PgSeverity::Debug => (Level::Debug, tracing::Level::DEBUG),
+                        PgSeverity::Info | PgSeverity::Log => (Level::Trace, tracing::Level::TRACE),
+                    };
+
+                    let log_is_enabled = log::log_enabled!(
+                        target: "sqlx::postgres::notice",
+                        log_level
+                    ) || sqlx_core::private_tracing_dynamic_enabled!(
+                        target: "sqlx::postgres::notice",
+                        tracing_level
+                    );
+                    if log_is_enabled {
+                        sqlx_core::private_tracing_dynamic_event!(
+                            target: "sqlx::postgres::notice",
+                            tracing_level,
+                            message = notice.message()
+                        );
+                    }
+
+                    continue;
+                }
+
+                _ => {}
+            }
+
+            return Poll::Ready(Ok(message));
         }
     }
 }

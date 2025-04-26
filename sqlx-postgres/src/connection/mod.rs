@@ -26,6 +26,7 @@ pub use self::stream::PgStream;
 pub(crate) mod describe;
 mod establish;
 mod executor;
+mod row_stream;
 mod sasl;
 mod stmt_cache;
 mod stream;

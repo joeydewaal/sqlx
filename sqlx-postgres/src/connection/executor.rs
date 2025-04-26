@@ -5,8 +5,8 @@ use crate::executor::{Execute, Executor};
 use crate::io::{PortalId, StatementId};
 use crate::logger::QueryLogger;
 use crate::message::{
-    self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, ParameterDescription, Parse,
-    ParseComplete, Query, ReadyForQuery, RowDescription,
+    self, BackendMessageFormat, Bind, Close, ParameterDescription, Parse, ParseComplete, Query,
+    RowDescription,
 };
 use crate::statement::PgStatementMetadata;
 use crate::{
@@ -21,6 +21,7 @@ use sqlx_core::arguments::Arguments;
 use sqlx_core::Either;
 use std::{borrow::Cow, pin::pin, sync::Arc};
 
+use super::row_stream::PgRowStream;
 use super::worker::Pipe;
 
 async fn prepare(
@@ -162,11 +163,11 @@ impl PgConnection {
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
-        let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
+        let logger = QueryLogger::new(query, self.inner.log_settings.clone());
 
-        let mut metadata: Arc<PgStatementMetadata>;
+        let metadata: Arc<PgStatementMetadata>;
 
-        let mut pipe;
+        let pipe;
 
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
@@ -246,90 +247,7 @@ impl PgConnection {
             PgValueFormat::Text
         };
 
-        Ok(try_stream! {
-            loop {
-                let message = pipe.recv().await?;
-
-                match message.format {
-                    BackendMessageFormat::BindComplete
-                    | BackendMessageFormat::ParseComplete
-                    | BackendMessageFormat::ParameterDescription
-                    | BackendMessageFormat::NoData
-                    // unnamed portal has been closed
-                    | BackendMessageFormat::CloseComplete
-                    => {
-                        // harmless messages to ignore
-                    }
-
-                    // "Execute phase is always terminated by the appearance of
-                    // exactly one of these messages: CommandComplete,
-                    // EmptyQueryResponse (if the portal was created from an
-                    // empty query string), ErrorResponse, or PortalSuspended"
-                    BackendMessageFormat::CommandComplete => {
-                        // a SQL command completed normally
-                        let cc: CommandComplete = message.decode()?;
-
-                        let rows_affected = cc.rows_affected();
-                        logger.increase_rows_affected(rows_affected);
-                        r#yield!(Either::Left(PgQueryResult {
-                            rows_affected,
-                        }));
-                    }
-
-                    BackendMessageFormat::EmptyQueryResponse => {
-                        // empty query string passed to an unprepared execute
-                    }
-
-                    // Message::ErrorResponse is handled in self.stream.recv()
-
-                    // incomplete query execution has finished
-                    BackendMessageFormat::PortalSuspended => {}
-
-                    BackendMessageFormat::RowDescription => {
-                        // indicates that a *new* set of rows are about to be returned
-                        let (columns, column_names) = self
-                            .handle_row_description(Some(message.decode()?), false)
-                            .await?;
-
-                        metadata = Arc::new(PgStatementMetadata {
-                            column_names: Arc::new(column_names),
-                            columns,
-                            parameters: Vec::default(),
-                        });
-                    }
-
-                    BackendMessageFormat::DataRow => {
-                        logger.increment_rows_returned();
-
-                        // one of the set of rows returned by a SELECT, FETCH, etc query
-                        let data: DataRow = message.decode()?;
-                        let row = PgRow {
-                            data,
-                            format,
-                            metadata: Arc::clone(&metadata),
-                        };
-
-                        r#yield!(Either::Right(row));
-                    }
-
-                    BackendMessageFormat::ReadyForQuery => {
-                        // processing of the query string is complete
-                        let rfq: ReadyForQuery = message.decode()?;
-                        self.set_transaction_status(rfq.transaction_status);
-                        break;
-                    }
-
-                    _ => {
-                        return Err(err_protocol!(
-                            "execute: unexpected message: {:?}",
-                            message.format
-                        ));
-                    }
-                }
-            }
-
-            Ok(())
-        })
+        Ok(PgRowStream::new(pipe, logger, metadata, format))
     }
 }
 
