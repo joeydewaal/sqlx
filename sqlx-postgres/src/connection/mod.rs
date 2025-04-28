@@ -13,7 +13,7 @@ use worker::{IoRequest, MessageBuf, Pipe, PipeUntil};
 use crate::error::Error;
 use crate::io::StatementId;
 use crate::message::{
-    Close, EncodeMessage, FrontendMessage, Query, ReceivedMessage, TransactionStatus,
+    Close, EncodeMessage, FrontendMessage, Notification, Query, ReceivedMessage, TransactionStatus
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
@@ -48,7 +48,7 @@ pub struct PgConnectionInner {
     // buffer of unreceived notification messages from `PUBLISH`
     // this is set when creating a PgListener and only written to if that listener is
     // re-used for query execution in-between receiving messages
-    pub(crate) notifications: UnboundedReceiver<ReceivedMessage>,
+    pub(crate) notifications: UnboundedReceiver<Notification>,
 
     shared_inner: Mutex<PgSharedInner>,
 
@@ -132,21 +132,6 @@ impl PgConnection {
         Ok(())
     }
 
-    // Make the background worker try and receive a notification, the receiver should only be
-    // dropped if the worker should stop trying to receive a notification. The notifications are
-    // returned through the channel in the `PgConnection` itself.
-    pub(crate) fn schedule_notification(
-        &self,
-    ) -> sqlx_core::Result<UnboundedReceiver<ReceivedMessage>> {
-        let notif = MessageBuf::new();
-        let (request, chan) = notif.finish(PipeUntil::Notification);
-        self.inner
-            .chan
-            .unbounded_send(request)
-            .map_err(|_| sqlx_core::Error::WorkerCrashed)?;
-        Ok(chan)
-    }
-
     /// Starts a temporary pipe to the background worker, the worker sends responses back until
     /// the the condition of `PipeUntil` is met.
     pub(crate) fn start_pipe<'c, F>(&'c self, callback: F) -> sqlx_core::Result<Pipe<'c>>
@@ -208,7 +193,7 @@ impl PgConnection {
     fn new(
         options: &PgConnectOptions,
         chan: UnboundedSender<IoRequest>,
-        notifications: UnboundedReceiver<ReceivedMessage>,
+        notifications: UnboundedReceiver<Notification>,
     ) -> Self {
         Self {
             inner: Box::new(PgConnectionInner {

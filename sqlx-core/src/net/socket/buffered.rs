@@ -1,7 +1,6 @@
 use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
-use std::io::Write;
 use std::ops::ControlFlow;
 use std::task::{ready, Context, Poll};
 use std::{cmp, io};
@@ -12,9 +11,9 @@ use crate::io::{AsyncRead, ProtocolDecode, ProtocolEncode};
 const DEFAULT_BUF_SIZE: usize = 8192;
 
 pub struct BufferedSocket<S> {
-    socket: S,
-    write_buf: WriteBuffer,
-    read_buf: ReadBuffer,
+    pub socket: S,
+    pub write_buf: WriteBuffer,
+    pub read_buf: ReadBuffer,
 }
 
 pub struct WriteBuffer {
@@ -90,6 +89,10 @@ impl<S: Socket> BufferedSocket<S> {
         &mut self.write_buf
     }
 
+    pub fn read_buffer_mut(&mut self) -> &mut BytesMut {
+        &mut self.read_buf.read
+    }
+
     pub async fn read<'de, T>(&mut self, byte_len: usize) -> Result<T, Error>
     where
         T: ProtocolDecode<'de, ()>,
@@ -124,16 +127,6 @@ impl<S: Socket> BufferedSocket<S> {
         Ok(())
     }
 
-    #[inline(always)]
-    pub fn write_raw(&mut self, value: &[u8]) -> Result<(), Error> {
-        let buf = self.write_buffer_mut();
-
-        buf.buf_mut().write_all(value)?;
-        buf.bytes_written += value.len();
-        buf.sanity_check();
-        Ok(())
-    }
-
     pub fn poll_read_buffered(
         &mut self,
         cx: &mut Context<'_>,
@@ -164,6 +157,19 @@ impl<S: Socket> BufferedSocket<S> {
 
             ready!(self.read_buf.poll_read(cx, read_len, &mut self.socket))?;
         }
+    }
+
+    pub fn _poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while !self.write_buf.is_empty() {
+            let written = ready!(self.socket.poll_write(cx, self.write_buf.get())?);
+            self.write_buf.consume(written);
+            self.write_buf.sanity_check();
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    pub fn _poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_flush(cx)
     }
 
     pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -216,7 +222,7 @@ impl<S: Socket> BufferedSocket<S> {
 }
 
 impl WriteBuffer {
-    fn sanity_check(&self) {
+    pub fn sanity_check(&self) {
         assert_ne!(self.buf.capacity(), 0);
         assert!(self.bytes_written <= self.buf.len());
         assert!(self.bytes_flushed <= self.bytes_written);
@@ -305,7 +311,7 @@ impl WriteBuffer {
         self.buf.shrink_to_fit();
     }
 
-    fn consume(&mut self, amt: usize) {
+    pub fn consume(&mut self, amt: usize) {
         let new_bytes_flushed = self
             .bytes_flushed
             .checked_add(amt)
@@ -326,7 +332,7 @@ impl WriteBuffer {
 }
 
 impl ReadBuffer {
-    fn poll_read(
+    pub fn poll_read(
         &mut self,
         cx: &mut Context<'_>,
         len: usize,

@@ -1,7 +1,6 @@
 use std::fmt::{self, Debug};
 use std::str::from_utf8;
 
-use futures_channel::mpsc::UnboundedReceiver;
 use futures_core::future::BoxFuture;
 use futures_core::stream::{BoxStream, Stream};
 use futures_util::{FutureExt, StreamExt, TryStreamExt};
@@ -12,10 +11,10 @@ use sqlx_core::Either;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
-use crate::message::{Notification, ReceivedMessage};
+use crate::message::Notification;
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
-use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
+use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, PipeUntil, Postgres};
 
 /// A stream of asynchronous notifications from Postgres.
 ///
@@ -219,14 +218,7 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            // Let the background worker know that we would like a notification. This does not send a
-            // notification back through the channel that was given. Instead it sends it back though
-            // the notification channel in the connection.
-            //
-            // The receiver that is returned acts like a guard, when it is dropped the background
-            // worker stops trying to get a notification. This makes this function cancellation
-            // safe.
-            let _guard = self.schedule_notif().await?;
+            let _ = self.connection.start_pipe(|_| Ok(PipeUntil::None))?;
             let next_message = self.connection.inner.notifications.next();
 
             let res = if let Some(ref mut close_event) = close_event {
@@ -243,7 +235,7 @@ impl PgListener {
                     self.reconnect().await?
                 }
                 Some(message) => {
-                    return Ok(Some(PgNotification(message.decode()?)));
+                    return Ok(Some(PgNotification(message)));
                 }
             }
         }
@@ -260,20 +252,6 @@ impl PgListener {
         Ok(())
     }
 
-    pub async fn schedule_notif(
-        &mut self,
-    ) -> sqlx_core::Result<UnboundedReceiver<ReceivedMessage>> {
-        let result = self.connection.schedule_notification();
-
-        if result.is_err() {
-            // If the worker crashed make sure get a new connection.
-            self.reconnect().await?;
-            return self.connection.schedule_notification();
-        } else {
-            return result;
-        }
-    }
-
     /// Receives the next notification that already exists in the connection buffer, if any.
     ///
     /// This is similar to `try_recv`, except it will not wait if the connection has not yet received a notification.
@@ -281,7 +259,7 @@ impl PgListener {
     /// This is helpful if you want to retrieve all buffered notifications and process them in batches.
     pub fn next_buffered(&mut self) -> Option<PgNotification> {
         if let Ok(Some(notification)) = self.connection.inner.notifications.try_next() {
-            Some(PgNotification(notification.decode().ok()?))
+            Some(PgNotification(notification))
         } else {
             None
         }

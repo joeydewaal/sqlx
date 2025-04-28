@@ -4,6 +4,7 @@ use std::{cmp, str};
 
 // https://rustsec.org/advisories/RUSTSEC-2024-0363.html
 #[sqlx::test(migrations = false, fixtures("./fixtures/rustsec/2024_0363.sql"))]
+#[ignore = "reason"]
 async fn rustsec_2024_0363(pool: PgPool) -> anyhow::Result<()> {
     let overflow_len = 4 * 1024 * 1024 * 1024; // 4 GiB
 

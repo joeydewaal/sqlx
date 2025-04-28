@@ -319,10 +319,10 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
 
     let _: CopyOutResponse = pipe.recv_expect().await?;
 
-    let (_, chan) = pipe.into_inner();
+    let (_, parts) = pipe.into_parts();
 
     let stream: TryAsyncStream<'c, Bytes> = try_stream! {
-        let mut pipe = Pipe::new(chan, &conn);
+        let mut pipe = Pipe::from_parts(&conn, parts);
         loop {
             match pipe.recv().await {
                 Err(e) => {

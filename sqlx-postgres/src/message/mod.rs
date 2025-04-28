@@ -1,4 +1,4 @@
-use sqlx_core::bytes::Bytes;
+use sqlx_core::bytes::{Buf, Bytes, BytesMut};
 use std::num::Saturating;
 
 use crate::error::Error;
@@ -225,5 +225,62 @@ impl<F: FrontendMessage> ProtocolEncode<'_, ()> for EncodeMessage<F> {
         buf.push(F::FORMAT as u8);
 
         buf.put_length_prefixed(|buf| self.0.encode_body(buf))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BatchedType {
+    Notification,
+    Done,
+    NotDone,
+}
+
+#[derive(Debug)]
+pub struct BatchReceivedMessage {
+    pub contents: BytesMut,
+    state: BatchedType,
+}
+
+impl BatchReceivedMessage {
+    pub fn done(contents: BytesMut) -> Self {
+        Self {
+            contents,
+            state: BatchedType::Done,
+        }
+    }
+
+    pub fn not_done(contents: BytesMut) -> Self {
+        Self {
+            contents,
+            state: BatchedType::NotDone,
+        }
+    }
+
+    pub fn notification(contents: BytesMut) -> Self {
+        Self {
+            contents,
+            state: BatchedType::Notification,
+        }
+    }
+
+    pub fn next(&mut self) -> sqlx_core::Result<Option<ReceivedMessage>> {
+        if self.contents.is_empty() {
+            return Ok(None);
+        } else {
+            let format = BackendMessageFormat::try_from_u8(self.contents.get_u8())?;
+
+            let data_len = self.contents.get_u32() as usize - 4;
+            let contents = self.contents.split_to(data_len).freeze();
+
+            Ok(Some(ReceivedMessage { format, contents }))
+        }
+    }
+
+    pub fn is_notif(&self) -> bool {
+        self.state == BatchedType::Notification
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.state == BatchedType::Done
     }
 }

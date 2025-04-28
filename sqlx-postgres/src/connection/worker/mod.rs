@@ -3,18 +3,23 @@ use std::{
     future::Future,
     ops::ControlFlow,
     pin::Pin,
-    task::{ready, Context, Poll},
+    task::{Context, Poll},
+    time::Instant,
 };
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::StreamExt;
 use sqlx_core::{
-    bytes::Buf as _,
-    net::{BufferedSocket, Socket},
+    bytes::{Buf as _, BytesMut},
+    net::{Framed, Socket},
     rt::spawn,
 };
+use tracing::{info, trace};
 
-use crate::message::{BackendMessageFormat, FrontendMessage, ReceivedMessage, Terminate};
+use crate::message::{
+    BackendMessageFormat, BatchReceivedMessage, FrontendMessage, Notification, ReceivedMessage,
+    Terminate,
+};
 
 use super::PgStream;
 
@@ -41,17 +46,18 @@ pub struct Worker {
     chan: UnboundedReceiver<IoRequest>,
     // Holds the requests from the `PgConnection` that still need a response.
     back_log: VecDeque<IoRequest>,
-    socket: BufferedSocket<Box<dyn Socket>>,
+    socket: Framed<Box<dyn Socket>>,
     // A channel that is used to send asynchronous notifications back to the `PgConnection` struct.
-    notif_chan: UnboundedSender<ReceivedMessage>,
+    notif_chan: UnboundedSender<Notification>,
     // Buffered responses that we couldn't handle
     buffered_msg: VecDeque<ReceivedMessage>,
+    currently_handling: Option<IoRequest>,
 }
 
 impl Worker {
     pub fn spawn(
         stream: PgStream,
-        notif_chan: UnboundedSender<ReceivedMessage>,
+        notif_chan: UnboundedSender<Notification>,
     ) -> UnboundedSender<IoRequest> {
         let (tx, rx) = unbounded();
 
@@ -60,9 +66,10 @@ impl Worker {
             should_flush: false,
             chan: rx,
             back_log: VecDeque::new(),
-            socket: stream.inner,
+            socket: Framed::new(stream.inner),
             notif_chan,
             buffered_msg: VecDeque::new(),
+            currently_handling: None,
         };
 
         spawn(conn);
@@ -77,15 +84,21 @@ impl Worker {
             return None;
         }
 
+        trace!("polling next request");
         match self.chan.poll_next_unpin(cx) {
-            Poll::Pending => None,
-            Poll::Ready(Some(request)) => Some(request),
+            Poll::Pending => {
+                trace!("waiting for request...");
+                None
+            }
+            Poll::Ready(Some(request)) => {
+                trace!("got request");
+                Some(request)
+            }
             Poll::Ready(None) => {
                 // Channel was closed, explicitly or because the sender was dropped. Either way
                 // we should start a gracefull shutdown.
                 self.socket
-                    .write_raw(&[Terminate::FORMAT as u8, 0, 0, 0, 4])
-                    .expect("Terminate message should fit in buffer");
+                    .write_raw(&[Terminate::FORMAT as u8, 0, 0, 0, 4]);
 
                 self.state = WorkerState::Closing;
                 self.should_flush = true;
@@ -98,11 +111,12 @@ impl Worker {
     fn poll_receiver(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
         // Try to receive a new io request from the channel.
         while let Some(msg) = self.poll_next_request(cx) {
+            info!("got new request");
             // Write the received message in the write buffer.
             //
             // TODO: This could grow the write buffer quite big when pipelining queries.
             // There should be a mechanism that shrinks the buffer once in a while.
-            self.socket.write_raw(&msg.data)?;
+            self.socket.write_raw(&msg.data);
 
             // Ensure we flush the write buffer.
             self.should_flush = true;
@@ -118,101 +132,79 @@ impl Worker {
     #[inline(always)]
     fn handle_poll_flush(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
         if self.should_flush {
+            trace!("poll_flush");
             if let Poll::Ready(_) = self.socket.poll_flush(cx) {
+                trace!("ready flushing");
                 self.should_flush = false;
+            } else {
+                trace!("not ready flushing");
             }
         }
         Ok(())
     }
 
-    #[inline(always)]
-    fn handle_response_and_done(&mut self, msg: &IoRequest, response: ReceivedMessage) -> bool {
-        let format = response.format;
+    fn send_back(&mut self, response: BatchReceivedMessage) {
+        let handling = if let Some(cur) = &mut self.currently_handling {
+            cur
+        } else if let Some(cur) = self.back_log.pop_front() {
+            self.currently_handling.insert(cur)
+        } else {
+            // self.buffered_msg.push_back(response);
+            return;
+        };
 
-        // Filter out notifications.
-        if format == BackendMessageFormat::NotificationResponse {
-            let _ = self.notif_chan.unbounded_send(response);
-            // We're only ready here if we actually want a [NotificationResponse].
-            return matches!(msg.pipe_until, PipeUntil::Notification);
-        }
-
-        match msg.pipe_until {
-            PipeUntil::None => unreachable!("We should never send a response back."),
-            PipeUntil::ReadyForQuery => {
-                let _ = msg.chan.unbounded_send(response);
-
-                format == BackendMessageFormat::ReadyForQuery
-            }
-            PipeUntil::ReadyForQueryOrCopyIn => {
-                let _ = msg.chan.unbounded_send(response);
-
-                format == BackendMessageFormat::ReadyForQuery
-                    || format == BackendMessageFormat::CopyInResponse
-            }
-            PipeUntil::Notification => {
-                // All the notifications are already filtered out, we only get other responses that
-                // we don't want. Make sure we store them in the buffer so we don't lose them.
-                let _ = self.buffered_msg.push_back(response);
-
-                // When the channel is closed it means the `Future` of `PgListener::try_next` (or
-                // `PgListener::try_next`) has been dropped, we shouldn't try to receive a
-                // notification again.
-                msg.chan.is_closed()
-            }
-        }
+        info!("sending response back");
+        let _ = handling.chan.unbounded_send(response);
     }
 
     #[inline(always)]
-    fn poll_backlog(&mut self, cx: &mut Context<'_>) -> Poll<sqlx_core::Result<()>> {
-        while let Some(msg) = self.back_log.pop_front() {
-            loop {
-                // Try and get a response, these could be buffered or _fresh_.
-                let response = match self.poll_next_message(cx) {
-                    Poll::Ready(response) => response?,
-                    Poll::Pending => {
-                        // We don't want to keep trying to receive a notification if the connection
-                        // doesn't want any.
-                        if !(matches!(msg.pipe_until, PipeUntil::Notification)
-                            && msg.chan.is_closed())
-                        {
-                            // Not ready for receiving messages. Push the message to the front so this
-                            // is the first request on the next poll.
-                            self.back_log.push_front(msg);
-                        }
-                        return Poll::Pending;
-                    }
-                };
+    fn poll_backlog(&mut self, cx: &mut Context<'_>) -> sqlx_core::Result<()> {
+        trace!("polling backlog");
 
-                if self.handle_response_and_done(&msg, response) {
-                    // We're done handling this message, move on to the next.
+        // Try and get a response from db.
+        while let Poll::Ready(mut response) = self.poll_next_message(cx)? {
+            if response.is_notif() {
+                trace!("got notif");
+                let notif: Notification = response.next()?.unwrap().decode()?;
+                let _ = self.notif_chan.unbounded_send(notif);
+                continue;
+            }
+
+            let is_done = response.is_done();
+            self.send_back(response);
+
+            if is_done {
+                if let Some(next_request) = self.back_log.pop_front() {
+                    trace!("we're pipelinging");
+                    self.currently_handling = Some(next_request);
+                } else {
+                    self.currently_handling = None;
+                    trace!("done handling request");
                     break;
                 }
             }
         }
-
-        // Once the backlog is done and we sent out all the responses, were closing the socket.
-        if self.state == WorkerState::Closing && self.back_log.is_empty() {
-            self.state = WorkerState::Closed;
-            return self.socket.poll_shutdown(cx).map_err(Into::into);
-        }
-        Poll::Pending
+        Ok(())
     }
 
-    #[inline(always)]
-    pub fn poll_next_message(
-        &mut self,
-        cx: &mut Context<'_>,
-    ) -> Poll<sqlx_core::Result<ReceivedMessage>> {
-        // Try and get a buffered message first.
-        if let Some(buffered) = self.buffered_msg.pop_front() {
-            return Poll::Ready(Ok(buffered));
-        }
+    pub fn get_next_messages(
+        buf: &mut BytesMut,
+    ) -> sqlx_core::Result<ControlFlow<BatchReceivedMessage, usize>> {
+        let mut index = 0;
+        let mut start = 0;
 
-        self.socket.poll_try_read(cx, |buf| {
+        loop {
             // all packets in postgres start with a 5-byte header
             // this header contains the message type and the total length of the message
-            let Some(mut header) = buf.get(..5) else {
-                return Ok(ControlFlow::Continue(5));
+            let Some(mut header) = buf.get(start..(start + 5)) else {
+                if index == 0 {
+                    return Ok(ControlFlow::Continue(5));
+                } else {
+                    info!("Not done: {index:?}");
+                    return Ok(ControlFlow::Break(BatchReceivedMessage::not_done(
+                        buf.split_to(start),
+                    )));
+                }
             };
 
             let format = BackendMessageFormat::try_from_u8(header.get_u8())?;
@@ -222,25 +214,57 @@ impl Worker {
             let expected_len = message_len
                 .checked_add(1)
                 // this shouldn't really happen but is mostly a sanity check
-                .ok_or_else(|| err_protocol!("message_len + 1 overflows usize: {message_len}"))?;
+                .ok_or_else(|| err_protocol!("message_len + 1 overflows usize: {message_len}"))?
+                + start;
 
             if buf.len() < expected_len {
-                return Ok(ControlFlow::Continue(expected_len));
+                if index == 0 {
+                    return Ok(ControlFlow::Continue(expected_len));
+                } else {
+                    return Ok(ControlFlow::Break(BatchReceivedMessage::not_done(
+                        buf.split_to(start),
+                    )));
+                }
             }
 
-            // `buf` SHOULD NOT be modified ABOVE this line
+            match format {
+                BackendMessageFormat::ReadyForQuery | BackendMessageFormat::CopyInResponse => {
+                    return Ok(ControlFlow::Break(BatchReceivedMessage::done(
+                        buf.split_to(expected_len),
+                    )));
+                }
+                BackendMessageFormat::NotificationResponse => {
+                    if index == 0 {
+                        return Ok(ControlFlow::Break(BatchReceivedMessage::notification(
+                            buf.split_to(expected_len),
+                        )));
+                    } else {
+                        return Ok(ControlFlow::Break(BatchReceivedMessage::not_done(
+                            buf.split_to(start),
+                        )));
+                    }
+                }
+                _ => {
+                    index += 1;
+                }
+            }
 
-            // pop off the format code since it's not counted in `message_len`
-            buf.advance(1);
+            start = expected_len;
+        }
+    }
 
-            // consume the message, including the length prefix
-            let mut contents = buf.split_to(message_len).freeze();
+    #[inline(always)]
+    pub fn poll_next_message(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<sqlx_core::Result<BatchReceivedMessage>> {
+        trace!("polling next message");
+        // Try and get a buffered message first.
+        // if let Some(buffered) = self.buffered_msg.pop_front() {
+        //     return Poll::Ready(Ok(buffered));
+        // }
 
-            // cut off the length prefix
-            contents.advance(4);
-
-            Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
-        })
+        self.socket.poll_try_read(cx, Self::get_next_messages)
     }
 
     #[inline(always)]
@@ -258,16 +282,19 @@ impl Future for Worker {
     type Output = sqlx_core::Result<()>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let start = Instant::now();
         // Only poll the future if we're not closed/closing.
-        ready!(self.poll_shutdown(cx)?);
+        // ready!(self.poll_shutdown(cx)?);
+
+        // Try to receive responses from the database and handle them.
+        self.poll_backlog(cx)?;
 
         // Push as many new requests in the write buffer as we can.
         self.poll_receiver(cx)?;
 
         // Flush the write buffer if needed.
         self.handle_poll_flush(cx)?;
-
-        // Try to receive responses from the database and handle them.
-        self.poll_backlog(cx)
+        info!("done: {:?}", start.elapsed());
+        Poll::Pending
     }
 }

@@ -1,7 +1,7 @@
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use sqlx_core::{io::ProtocolEncode, Error};
 
-use crate::message::{self, EncodeMessage, FrontendMessage, ReceivedMessage};
+use crate::message::{self, BatchReceivedMessage, EncodeMessage, FrontendMessage, ReceivedMessage};
 
 /// Pipes responses from the background worker to the sender until one of these conditions is met.
 #[derive(Debug, PartialEq)]
@@ -14,15 +14,12 @@ pub enum PipeUntil {
     /// Worker sends responses back until it either received a [CopyIn] or a
     /// [ReadyForQuery] response.
     ReadyForQueryOrCopyIn,
-    /// Makes the background worker try and receive a [NotificationResponse], the response is sent
-    /// through the notification channel in the `PgConnection` not through the given channel.
-    Notification,
 }
 
 /// A request for the background worker.
 #[derive(Debug)]
 pub struct IoRequest {
-    pub chan: UnboundedSender<ReceivedMessage>,
+    pub chan: UnboundedSender<BatchReceivedMessage>,
     pub data: Vec<u8>,
     pub pipe_until: PipeUntil,
 }
@@ -64,7 +61,7 @@ impl MessageBuf {
         &mut self.data
     }
 
-    pub fn finish(self, pipe_until: PipeUntil) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
+    pub fn finish(self, pipe_until: PipeUntil) -> (IoRequest, UnboundedReceiver<BatchReceivedMessage>) {
         // We're using an unbounded channel here for sending responses back mostly for
         // convenience. Should this be changed to a bounded one?
         let (chan, receiver) = unbounded();

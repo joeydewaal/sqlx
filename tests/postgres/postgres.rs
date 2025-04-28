@@ -1169,10 +1169,14 @@ async fn test_pg_listener_implements_acquire() -> anyhow::Result<()> {
         .execute(&mut *txn)
         .await?;
 
+    println!("commit");
     txn.commit().await?;
+    println!("commit done");
 
     // And now we can receive the notification we sent in the transaction
+    println!("receive");
     let notification = listener.recv().await?;
+    println!("receive done");
     assert_eq!(
         notification.channel(),
         "test_pg_listener_implements_acquire"

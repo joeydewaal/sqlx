@@ -7,10 +7,12 @@ use std::task::{ready, Context, Poll};
 use bytes::BufMut;
 
 pub use buffered::{BufferedSocket, WriteBuffer};
+pub use framed::Framed;
 
 use crate::io::ReadBuf;
 
 mod buffered;
+mod framed;
 
 pub trait Socket: Send + Sync + Unpin + 'static {
     fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize>;
@@ -46,9 +48,13 @@ pub trait Socket: Send + Sync + Unpin + 'static {
         while buf.has_remaining_mut() {
             match self.try_read(buf) {
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // info!("waiting on read");
                     ready!(self.poll_read_ready(cx))?;
                 }
-                ready => return Poll::Ready(ready),
+                ready => {
+                    // info!("done reading");
+                    return Poll::Ready(ready)
+                },
             }
         }
 
