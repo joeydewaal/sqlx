@@ -1,5 +1,6 @@
 mod buf;
 mod buf_mut;
+mod codec;
 // mod buf_stream;
 mod decode;
 mod encode;
@@ -9,6 +10,7 @@ mod read_buf;
 pub use buf::BufExt;
 pub use buf_mut::BufMutExt;
 //pub use buf_stream::BufStream;
+pub use codec::Codec;
 pub use decode::ProtocolDecode;
 pub use encode::ProtocolEncode;
 pub use read_buf::ReadBuf;
