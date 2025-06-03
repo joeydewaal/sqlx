@@ -2,12 +2,13 @@ use crate::error::Error;
 use crate::net::Socket;
 use bytes::BytesMut;
 use std::ops::ControlFlow;
+use std::task::{ready, Context, Poll};
 use std::{cmp, io};
 
-use crate::io::{AsyncRead, AsyncReadExt, ProtocolDecode, ProtocolEncode};
+use crate::io::{AsyncRead, AsyncReadExt, Codec, ProtocolDecode, ProtocolEncode};
 
 // Tokio, async-std, and std all use this as the default capacity for their buffered I/O.
-const DEFAULT_BUF_SIZE: usize = 8192;
+pub const DEFAULT_BUF_SIZE: usize = 8192;
 
 pub struct BufferedSocket<S> {
     socket: S,
@@ -43,6 +44,13 @@ impl<S: Socket> BufferedSocket<S> {
                 available: BytesMut::with_capacity(DEFAULT_BUF_SIZE),
             },
         }
+    }
+
+    #[inline(always)]
+    pub fn poll_read(&mut self, cx: &mut Context<'_>) -> Poll<Result<usize, io::Error>> {
+        let read = ready!(self.socket.poll_read(cx, &mut self.read_buf.available)?);
+        self.read_buf.advance(read);
+        Poll::Ready(Ok(read))
     }
 
     pub async fn read_buffered(&mut self, len: usize) -> Result<BytesMut, Error> {
@@ -122,6 +130,35 @@ impl<S: Socket> BufferedSocket<S> {
         Ok(())
     }
 
+    #[inline(always)]
+    pub fn encode<C: Codec>(&mut self, codec: &mut C, item: C::Request) -> Result<(), Error> {
+        let buf = self.write_buf.buf_mut();
+        codec.encode(buf, item)?;
+
+        self.write_buf.bytes_written = buf.len();
+        self.write_buf.sanity_check();
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn decode<C: Codec>(&mut self, codec: &mut C) -> Result<Option<C::Response>, Error> {
+        codec.decode(&mut self.read_buf.read)
+    }
+
+    #[inline(always)]
+    pub fn poll_flush(self: &mut Self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+
+        while !this.write_buf.is_empty() {
+            let buf = this.write_buf.get();
+            let written = ready!(this.socket.poll_write(cx, buf)?);
+            // consume does the sanity check.
+            this.write_buf.consume(written);
+        }
+
+        this.socket.poll_flush(cx)
+    }
+
     pub async fn flush(&mut self) -> io::Result<()> {
         while !self.write_buf.is_empty() {
             let written = self.socket.write(self.write_buf.get()).await?;
@@ -132,6 +169,11 @@ impl<S: Socket> BufferedSocket<S> {
         self.socket.flush().await?;
 
         Ok(())
+    }
+
+    #[inline(always)]
+    pub fn poll_shutdown(self: &mut Self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_shutdown(cx)
     }
 
     pub async fn shutdown(&mut self) -> io::Result<()> {

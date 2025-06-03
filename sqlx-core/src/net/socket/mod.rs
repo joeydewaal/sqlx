@@ -7,10 +7,12 @@ use std::task::{ready, Context, Poll};
 use bytes::BufMut;
 
 pub use buffered::{BufferedSocket, WriteBuffer};
+pub use framed::Framed;
 
 use crate::io::ReadBuf;
 
 mod buffered;
+mod framed;
 
 pub trait Socket: Send + Sync + Unpin + 'static {
     fn try_read(&mut self, buf: &mut dyn ReadBuf) -> io::Result<usize>;
@@ -28,11 +30,43 @@ pub trait Socket: Send + Sync + Unpin + 'static {
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut dyn ReadBuf,
+    ) -> Poll<Result<usize, io::Error>> {
+        let this = &mut *self;
+
+        while buf.has_remaining_mut() {
+            match this.try_read(&mut *buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(this.poll_read_ready(cx))?;
+                }
+                ready => return Poll::Ready(ready),
+            }
+        }
+
+        Poll::Ready(Ok(0))
+    }
+
     fn read<'a, B: ReadBuf>(&'a mut self, buf: &'a mut B) -> Read<'a, Self, B>
     where
         Self: Sized,
     {
         Read { socket: self, buf }
+    }
+
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<Result<usize, io::Error>> {
+        while !buf.is_empty() {
+            match self.try_write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.poll_write_ready(cx))?;
+                }
+                ready => return Poll::Ready(ready),
+            }
+        }
+
+        Poll::Ready(Ok(0))
     }
 
     fn write<'a>(&'a mut self, buf: &'a [u8]) -> Write<'a, Self>
