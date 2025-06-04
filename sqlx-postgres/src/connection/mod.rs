@@ -23,6 +23,7 @@ pub(crate) use sqlx_core::connection::*;
 
 pub use self::stream::PgStream;
 
+mod codec;
 pub(crate) mod describe;
 mod establish;
 mod executor;

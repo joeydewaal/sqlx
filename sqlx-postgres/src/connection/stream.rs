@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
-use std::ops::{ControlFlow, Deref, DerefMut};
+use std::ops::{Deref, DerefMut};
 use std::str::FromStr;
 
 use futures_channel::mpsc::UnboundedSender;
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use log::Level;
-use sqlx_core::bytes::Buf;
+use sqlx_core::io::ProtocolEncode;
+use sqlx_core::net::Framed;
 
 use crate::connection::tls::MaybeUpgradeTls;
 use crate::error::Error;
@@ -13,8 +14,10 @@ use crate::message::{
     BackendMessage, BackendMessageFormat, EncodeMessage, FrontendMessage, Notice, Notification,
     ParameterStatus, ReceivedMessage,
 };
-use crate::net::{self, BufferedSocket, Socket};
+use crate::net::{self, Socket};
 use crate::{PgConnectOptions, PgDatabaseError, PgSeverity};
+
+use super::codec::PostgresCodec;
 
 // the stream is a separate type from the connection to uphold the invariant where an instantiated
 // [PgConnection] is a **valid** connection to postgres
@@ -28,7 +31,7 @@ use crate::{PgConnectOptions, PgDatabaseError, PgSeverity};
 pub struct PgStream {
     // A trait object is okay here as the buffering amortizes the overhead of both the dynamic
     // function call as well as the syscall.
-    inner: BufferedSocket<Box<dyn Socket>>,
+    inner: Framed<Box<dyn Socket>, PostgresCodec>,
 
     // buffer of unreceived notification messages from `PUBLISH`
     // this is set when creating a PgListener and only written to if that listener is
@@ -50,11 +53,22 @@ impl PgStream {
         let socket = socket_result?;
 
         Ok(Self {
-            inner: BufferedSocket::new(socket),
+            inner: Framed::new(socket, PostgresCodec::new()),
             notifications: None,
             parameter_statuses: BTreeMap::default(),
             server_version_num: None,
         })
+    }
+
+    #[inline(always)]
+    pub(crate) fn write<'e>(&mut self, message: impl ProtocolEncode<'e, ()>) -> Result<(), Error> {
+        let mut buf = Vec::new();
+        message.encode(&mut buf)?;
+        self.inner.start_send_unpin(buf)
+    }
+
+    pub async fn flush(&mut self) -> crate::Result<()> {
+        self.inner.flush().await
     }
 
     #[inline(always)]
@@ -66,8 +80,9 @@ impl PgStream {
     where
         T: FrontendMessage,
     {
-        self.write_msg(message)?;
-        self.flush().await?;
+        let mut buf = Vec::new();
+        EncodeMessage(message).encode(&mut buf)?;
+        SinkExt::send(&mut self.inner, buf).await?;
         Ok(())
     }
 
@@ -77,45 +92,10 @@ impl PgStream {
     }
 
     pub(crate) async fn recv_unchecked(&mut self) -> Result<ReceivedMessage, Error> {
-        // NOTE: to not break everything, this should be cancel-safe;
-        // DO NOT modify `buf` unless a full message has been read
         self.inner
-            .try_read(|buf| {
-                // all packets in postgres start with a 5-byte header
-                // this header contains the message type and the total length of the message
-                let Some(mut header) = buf.get(..5) else {
-                    return Ok(ControlFlow::Continue(5));
-                };
-
-                let format = BackendMessageFormat::try_from_u8(header.get_u8())?;
-
-                let message_len = header.get_u32() as usize;
-
-                let expected_len = message_len
-                    .checked_add(1)
-                    // this shouldn't really happen but is mostly a sanity check
-                    .ok_or_else(|| {
-                        err_protocol!("message_len + 1 overflows usize: {message_len}")
-                    })?;
-
-                if buf.len() < expected_len {
-                    return Ok(ControlFlow::Continue(expected_len));
-                }
-
-                // `buf` SHOULD NOT be modified ABOVE this line
-
-                // pop off the format code since it's not counted in `message_len`
-                buf.advance(1);
-
-                // consume the message, including the length prefix
-                let mut contents = buf.split_to(message_len).freeze();
-
-                // cut off the length prefix
-                contents.advance(4);
-
-                Ok(ControlFlow::Break(ReceivedMessage { format, contents }))
-            })
+            .next()
             .await
+            .ok_or_else(|| Error::WorkerCrashed)?
     }
 
     // Get the next message from the server
@@ -198,10 +178,14 @@ impl PgStream {
             return Ok(message);
         }
     }
+
+    pub async fn shutdown(&mut self) -> crate::Result<()> {
+        self.inner.close().await
+    }
 }
 
 impl Deref for PgStream {
-    type Target = BufferedSocket<Box<dyn Socket>>;
+    type Target = Framed<Box<dyn Socket>, PostgresCodec>;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
