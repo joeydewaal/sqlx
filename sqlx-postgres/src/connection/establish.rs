@@ -1,3 +1,5 @@
+use futures_channel::mpsc::unbounded;
+
 use crate::HashMap;
 
 use crate::common::StatementCache;
@@ -9,6 +11,7 @@ use crate::message::{
 };
 use crate::{PgConnectOptions, PgConnection};
 
+use super::worker::Worker;
 use super::PgConnectionInner;
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
@@ -18,6 +21,13 @@ impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
         let mut stream = PgStream::connect(options).await?;
+
+        let stream_bg = PgStream::connect(options).await?;
+
+        let (notif_tx, notif_rx) = unbounded();
+
+        // Spawn the background worker.
+        let worker_tx = Worker::spawn(stream_bg, notif_tx);
 
         // To begin a session, a frontend opens a connection to the server
         // and sends a startup message.
