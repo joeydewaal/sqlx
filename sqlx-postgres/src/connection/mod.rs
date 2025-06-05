@@ -12,10 +12,7 @@ use crate::common::StatementCache;
 use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::io::StatementId;
-use crate::message::{
-    BackendMessageFormat, FrontendMessage, Notification, Query, ReadyForQuery, ReceivedMessage,
-    TransactionStatus,
-};
+use crate::message::{FrontendMessage, Notification, Query, TransactionStatus};
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
 use crate::types::Oid;
@@ -164,6 +161,21 @@ impl PgConnection {
     {
         let req = self.create_request(|buf| buf.write_msg(value))?;
         self.send_request(req)
+    }
+
+    pub(crate) async fn start_pipe_async<F, R>(&self, callback: F) -> sqlx_core::Result<(R, Pipe)>
+    where
+        F: AsyncFnOnce(&mut MessageBuf) -> sqlx_core::Result<R>,
+    {
+        let mut buffer = MessageBuf::new();
+        let result = (callback)(&mut buffer).await?;
+        let mut req = buffer.finish();
+        let (tx, rx) = unbounded();
+        req.chan = Some(tx);
+
+        self.send_request(req)?;
+
+        Ok((result, Pipe::new(rx)))
     }
 }
 
