@@ -182,6 +182,10 @@ impl PgStream {
     pub async fn shutdown(&mut self) -> crate::Result<()> {
         self.inner.close().await
     }
+
+    pub fn into_inner(self) -> Framed<Box<dyn Socket>, PostgresCodec> {
+        self.inner
+    }
 }
 
 impl Deref for PgStream {
