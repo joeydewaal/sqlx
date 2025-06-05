@@ -20,6 +20,8 @@ use sqlx_core::arguments::Arguments;
 use sqlx_core::Either;
 use std::{borrow::Cow, pin::pin, sync::Arc};
 
+use super::worker::Pipe;
+
 async fn prepare(
     conn: &mut PgConnection,
     sql: &str,
@@ -45,51 +47,41 @@ async fn prepare(
         param_types.push(conn.resolve_type_id(&ty.0).await?);
     }
 
-    // flush and wait until we are re-ready
-    conn.wait_until_ready().await?;
+    let mut pipe = conn.pipe(|buf| {
+        buf.write_msg(Parse {
+            param_types: &param_types,
+            query: sql,
+            statement: id,
+        })?;
+        if metadata.is_none() {
+            // get the statement columns and parameters
+            buf.write_msg(message::Describe::Statement(id))?;
+        }
 
-    // next we send the PARSE command to the server
-    conn.inner.stream.write_msg(Parse {
-        param_types: &param_types,
-        query: sql,
-        statement: id,
+        // we ask for the server to immediately send us the result of the PARSE command
+        Ok(buf.write_sync())
     })?;
 
-    if metadata.is_none() {
-        // get the statement columns and parameters
-        conn.inner
-            .stream
-            .write_msg(message::Describe::Statement(id))?;
-    }
-
-    // we ask for the server to immediately send us the result of the PARSE command
-    conn.write_sync();
-    conn.inner.stream.flush().await?;
-
     // indicates that the SQL query string is now successfully parsed and has semantic validity
-    conn.inner.stream.recv_expect::<ParseComplete>().await?;
+    pipe.recv_expect::<ParseComplete>().await?;
 
     let metadata = if let Some(metadata) = metadata {
         // each SYNC produces one READY FOR QUERY
-        conn.recv_ready_for_query().await?;
+        pipe.recv_ready_for_query().await?;
 
         // we already have metadata
         metadata
     } else {
-        let parameters = recv_desc_params(conn).await?;
+        let parameters = recv_desc_params(&mut pipe).await?;
 
-        let rows = recv_desc_rows(conn).await?;
+        let rows = recv_desc_rows(&mut pipe).await?;
 
         // each SYNC produces one READY FOR QUERY
-        conn.recv_ready_for_query().await?;
+        pipe.recv_ready_for_query().await?;
 
         let parameters = conn.handle_parameter_description(parameters).await?;
 
         let (columns, column_names) = conn.handle_row_description(rows, true).await?;
-
-        // ensure that if we did fetch custom data, we wait until we are fully ready before
-        // continuing
-        conn.wait_until_ready().await?;
 
         Arc::new(PgStatementMetadata {
             parameters,
@@ -101,12 +93,12 @@ async fn prepare(
     Ok((id, metadata))
 }
 
-async fn recv_desc_params(conn: &mut PgConnection) -> Result<ParameterDescription, Error> {
-    conn.inner.stream.recv_expect().await
+async fn recv_desc_params(pipe: &mut Pipe) -> Result<ParameterDescription, Error> {
+    pipe.recv_expect().await
 }
 
-async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription>, Error> {
-    let rows: Option<RowDescription> = match conn.inner.stream.recv().await? {
+async fn recv_desc_rows(pipe: &mut Pipe) -> Result<Option<RowDescription>, Error> {
+    let rows: Option<RowDescription> = match pipe.recv().await? {
         // describes the rows that will be returned when the statement is eventually executed
         message if message.format == BackendMessageFormat::RowDescription => {
             Some(message.decode()?)
@@ -127,44 +119,6 @@ async fn recv_desc_rows(conn: &mut PgConnection) -> Result<Option<RowDescription
 }
 
 impl PgConnection {
-    // wait for CloseComplete to indicate a statement was closed
-    pub(super) async fn wait_for_close_complete(&mut self, mut count: usize) -> Result<(), Error> {
-        // we need to wait for the [CloseComplete] to be returned from the server
-        while count > 0 {
-            match self.inner.stream.recv().await? {
-                message if message.format == BackendMessageFormat::PortalSuspended => {
-                    // there was an open portal
-                    // this can happen if the last time a statement was used it was not fully executed
-                }
-
-                message if message.format == BackendMessageFormat::CloseComplete => {
-                    // successfully closed the statement (and freed up the server resources)
-                    count -= 1;
-                }
-
-                message => {
-                    return Err(err_protocol!(
-                        "expecting PortalSuspended or CloseComplete but received {:?}",
-                        message.format
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[inline(always)]
-    pub(crate) fn write_sync(&mut self) {
-        self.inner
-            .stream
-            .write_msg(message::Sync)
-            .expect("BUG: Sync should not be too big for protocol");
-
-        // all SYNC messages will return a ReadyForQuery
-        self.inner.pending_ready_for_query_count += 1;
-    }
-
     async fn get_or_prepare(
         &mut self,
         sql: &str,
@@ -183,11 +137,11 @@ impl PgConnection {
         if persistent && self.inner.cache_statement.is_enabled() {
             if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
                 self.inner.stream.write_msg(Close::Statement(id))?;
-                self.write_sync();
+                // self.write_sync();
 
                 self.inner.stream.flush().await?;
 
-                self.wait_for_close_complete(1).await?;
+                // self.wait_for_close_complete(1).await?;
                 self.recv_ready_for_query().await?;
             }
         }
@@ -203,9 +157,6 @@ impl PgConnection {
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
-
-        // before we continue, wait until we are "ready" to accept more queries
-        self.wait_until_ready().await?;
 
         let mut metadata: Arc<PgStatementMetadata>;
 
@@ -233,9 +184,6 @@ impl PgConnection {
 
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
-
-            // consume messages till `ReadyForQuery` before bind and execute
-            self.wait_until_ready().await?;
 
             // bind to attach the arguments to the statement and create a portal
             self.inner.stream.write_msg(Bind {
@@ -273,7 +221,7 @@ impl PgConnection {
             // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
             // is still serial but it would reduce round-trips. Some kind of builder pattern that is
             // termed batching might suit this.
-            self.write_sync();
+            // self.write_sync();
 
             // prepared statements are binary
             PgValueFormat::Binary
@@ -451,8 +399,6 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
         'c: 'e,
     {
         Box::pin(async move {
-            self.wait_until_ready().await?;
-
             let (_, metadata) = self.get_or_prepare(sql, parameters, true, None).await?;
 
             Ok(PgStatement {
@@ -470,8 +416,6 @@ impl<'c> Executor<'c> for &'c mut PgConnection {
         'c: 'e,
     {
         Box::pin(async move {
-            self.wait_until_ready().await?;
-
             let (stmt_id, metadata) = self.get_or_prepare(sql, &[], true, None).await?;
 
             let nullable = self.get_nullable_for_columns(stmt_id, &metadata).await?;

@@ -6,6 +6,7 @@ use crate::HashMap;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
+use sqlx_core::statement::Statement;
 use worker::{IoRequest, MessageBuf, Pipe};
 
 use crate::common::StatementCache;
@@ -57,6 +58,8 @@ pub struct PgConnectionInner {
     #[allow(dead_code)]
     secret_key: u32,
 
+    pub(crate) server_version_num: Option<u32>,
+
     // sequence of statement IDs for use in preparing statements
     // in PostgreSQL, the statement is prepared to a user-supplied identifier
     next_statement_id: StatementId,
@@ -68,8 +71,6 @@ pub struct PgConnectionInner {
     cache_type_info: HashMap<Oid, PgTypeInfo>,
     cache_type_oid: HashMap<UStr, Oid>,
     cache_elem_type_to_array: HashMap<Oid, Oid>,
-
-    // number of ReadyForQuery messages that we are currently expecting
     pub(crate) pending_ready_for_query_count: usize,
 
     // current transaction status
@@ -84,11 +85,6 @@ pub struct PgConnectionInner {
 }
 
 impl PgConnection {
-    /// the version number of the server in `libpq` format
-    pub fn server_version_num(&self) -> Option<u32> {
-        self.inner.stream.server_version_num
-    }
-
     // will return when the connection is ready for another query
     pub(crate) async fn wait_until_ready(&mut self) -> Result<(), Error> {
         if !self.inner.stream.write_buffer_mut().is_empty() {
@@ -106,6 +102,7 @@ impl PgConnection {
         Ok(())
     }
 
+    /// the version number of the server in `libpq` format
     async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
         let r: ReadyForQuery = self.inner.stream.recv_expect().await?;
 
@@ -128,15 +125,43 @@ impl PgConnection {
         Ok(())
     }
 
+    pub fn server_version_num(&self) -> Option<u32> {
+        self.inner.server_version_num
+    }
+
+    fn new(
+        options: &PgConnectOptions,
+        chan: UnboundedSender<IoRequest>,
+        notifications: UnboundedReceiver<Notification>,
+        stream: PgStream,
+    ) -> Self {
+        Self {
+            inner: Box::new(PgConnectionInner {
+                stream,
+                chan,
+                notifications,
+                log_settings: options.log_settings.clone(),
+                process_id: 0,
+                secret_key: 0,
+                next_statement_id: StatementId::NAMED_START,
+                cache_statement: StatementCache::new(options.statement_cache_capacity),
+                cache_type_info: HashMap::new(),
+                cache_type_oid: HashMap::new(),
+                cache_elem_type_to_array: HashMap::new(),
+                transaction_status: TransactionStatus::Idle,
+                transaction_depth: 0,
+                server_version_num: None,
+                pending_ready_for_query_count: 0,
+            }),
+        }
+    }
+
     /// Queue a simple query (not prepared) to execute the next time this connection is used.
     ///
     /// Used for rolling back transactions and releasing advisory locks.
     #[inline(always)]
-    pub(crate) fn queue_simple_query(&mut self, query: &str) -> Result<(), Error> {
-        self.inner.stream.write_msg(Query(query))?;
-        self.inner.pending_ready_for_query_count += 1;
-
-        Ok(())
+    pub(crate) fn queue_simple_query(&mut self, query: &str) -> Result<Pipe, Error> {
+        self.pipe(|buf| buf.write_msg(Query(query)))
     }
 
     pub(crate) fn in_transaction(&self) -> bool {
@@ -194,7 +219,7 @@ impl Connection for PgConnection {
 
     type Options = PgConnectOptions;
 
-    fn close(mut self) -> BoxFuture<'static, Result<(), Error>> {
+    fn close(self) -> BoxFuture<'static, Result<(), Error>> {
         // The normal, graceful termination procedure is that the frontend sends a Terminate
         // message and immediately closes the connection.
 
@@ -202,17 +227,14 @@ impl Connection for PgConnection {
         // connection and terminates.
 
         Box::pin(async move {
-            self.inner.stream.send(Terminate).await?;
-            self.inner.stream.shutdown().await?;
-
+            self.inner.chan.close_channel();
             Ok(())
         })
     }
 
-    fn close_hard(mut self) -> BoxFuture<'static, Result<(), Error>> {
+    fn close_hard(self) -> BoxFuture<'static, Result<(), Error>> {
         Box::pin(async move {
-            self.inner.stream.shutdown().await?;
-
+            self.inner.chan.close_channel();
             Ok(())
         })
     }
@@ -224,8 +246,8 @@ impl Connection for PgConnection {
 
         Box::pin(async move {
             // The simplest call-and-response that's possible.
-            self.write_sync();
-            self.wait_until_ready().await
+            let mut pipe = self.pipe(|buf| Ok(buf.write_sync()))?;
+            pipe.recv_ready_for_query().await
         })
     }
 
@@ -254,39 +276,39 @@ impl Connection for PgConnection {
         Box::pin(async move {
             self.inner.cache_type_oid.clear();
 
-            let mut cleared = 0_usize;
-
-            self.wait_until_ready().await?;
-
-            while let Some((id, _)) = self.inner.cache_statement.remove_lru() {
-                self.inner.stream.write_msg(Close::Statement(id))?;
-                cleared += 1;
-            }
-
-            if cleared > 0 {
-                self.write_sync();
-                self.inner.stream.flush().await?;
-
-                self.wait_for_close_complete(cleared).await?;
-                self.recv_ready_for_query().await?;
-            }
+            // let mut cleared = 0_usize;
 
             Ok(())
+            // TODO
+            // while let Some((id, _)) = self.inner.cache_statement.remove_lru() {
+            //     self.inner.stream.write_msg(Close::Statement(id))?;
+            //     cleared += 1;
+            // }
+
+            // if cleared > 0 {
+            //     self.write_sync();
+            //     self.inner.stream.flush().await?;
+
+            //     self.wait_for_close_complete(cleared).await?;
+            //     self.recv_ready_for_query().await?;
+            // }
+
+            // Ok(())
         })
     }
 
     fn shrink_buffers(&mut self) {
-        self.inner.stream.shrink_buffers();
+        // No-op
     }
 
     #[doc(hidden)]
     fn flush(&mut self) -> BoxFuture<'_, Result<(), Error>> {
-        self.wait_until_ready().boxed()
+        async { Ok(()) }.boxed()
     }
 
     #[doc(hidden)]
     fn should_flush(&self) -> bool {
-        !self.inner.stream.write_buffer().is_empty()
+        false
     }
 }
 

@@ -121,6 +121,7 @@ impl Worker {
 
     #[inline(always)]
     fn send_back(&mut self, response: ReceivedMessage) -> Result<()> {
+        println!("sending response back {response:?}");
         if let Some(chan) = self.back_log.front_mut() {
             let _ = chan.unbounded_send(response);
             Ok(())
@@ -174,7 +175,7 @@ impl Worker {
             // The buffer is closed, a [Terminate] message has been sent, now try and close the socket.
             self.socket.poll_close_unpin(cx)
         } else {
-            Poll::Ready(Ok(()))
+            Poll::Pending
         }
     }
 }

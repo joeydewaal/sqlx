@@ -147,13 +147,12 @@ pub struct PgCopyIn<C: DerefMut<Target = PgConnection>> {
 
 impl<C: DerefMut<Target = PgConnection>> PgCopyIn<C> {
     async fn begin(mut conn: C, statement: &str) -> Result<Self> {
-        conn.wait_until_ready().await?;
-        conn.inner.stream.send(Query(statement)).await?;
+        let mut pipe = conn.queue_simple_query(statement)?;
 
-        let response = match conn.inner.stream.recv_expect::<CopyInResponse>().await {
+        let response = match pipe.recv_expect::<CopyInResponse>().await {
             Ok(res) => res.0,
             Err(e) => {
-                conn.inner.stream.recv().await?;
+                pipe.recv().await?;
                 return Err(e);
             }
         };
