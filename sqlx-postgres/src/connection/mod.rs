@@ -3,16 +3,18 @@ use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
 
 use crate::HashMap;
+use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
+use worker::{IoRequest, MessageBuf, Pipe};
 
 use crate::common::StatementCache;
 use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::io::StatementId;
 use crate::message::{
-    BackendMessageFormat, Close, Query, ReadyForQuery, ReceivedMessage, Terminate,
-    TransactionStatus,
+    BackendMessageFormat, Close, EncodeMessage, FrontendMessage, Notification, Query,
+    ReadyForQuery, ReceivedMessage, Terminate, TransactionStatus,
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
@@ -75,6 +77,10 @@ pub struct PgConnectionInner {
     pub(crate) transaction_depth: usize,
 
     log_settings: LogSettings,
+
+    chan: UnboundedSender<IoRequest>,
+
+    notifications: UnboundedReceiver<Notification>,
 }
 
 impl PgConnection {
@@ -138,6 +144,42 @@ impl PgConnection {
             TransactionStatus::Transaction => true,
             TransactionStatus::Error | TransactionStatus::Idle => false,
         }
+    }
+
+    fn create_request<F>(&self, callback: F) -> sqlx_core::Result<IoRequest>
+    where
+        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<()>,
+    {
+        let mut buffer = MessageBuf::new();
+        (callback)(&mut buffer)?;
+        Ok(buffer.finish())
+    }
+
+    fn send_request(&self, request: IoRequest) -> sqlx_core::Result<()> {
+        self.inner
+            .chan
+            .unbounded_send(request)
+            .map_err(|_| sqlx_core::Error::WorkerCrashed)
+    }
+
+    pub(crate) fn pipe<F>(&self, callback: F) -> sqlx_core::Result<Pipe>
+    where
+        F: FnOnce(&mut MessageBuf) -> sqlx_core::Result<()>,
+    {
+        let mut req = self.create_request(callback)?;
+        let (tx, rx) = unbounded();
+        req.chan = Some(tx);
+
+        self.send_request(req)?;
+        Ok(Pipe::new(rx))
+    }
+
+    pub(crate) fn pipe_and_forget<T>(&self, value: T) -> sqlx_core::Result<()>
+    where
+        T: FrontendMessage,
+    {
+        let req = self.create_request(|buf| buf.write_msg(value))?;
+        self.send_request(req)
     }
 }
 

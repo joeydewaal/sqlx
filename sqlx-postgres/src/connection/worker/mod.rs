@@ -21,7 +21,8 @@ use super::{codec::PostgresCodec, PgStream};
 mod pipe;
 mod request;
 
-pub use request::IoRequest;
+pub use pipe::Pipe;
+pub use request::{IoRequest, MessageBuf};
 
 #[derive(PartialEq, Debug)]
 enum WorkerState {

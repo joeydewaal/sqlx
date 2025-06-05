@@ -42,18 +42,10 @@ impl MessageBuf {
         &mut self.data
     }
 
-    pub fn without_response(self) -> IoRequest {
+    pub fn finish(self) -> IoRequest {
         IoRequest {
             data: self.data,
             chan: None,
         }
-    }
-
-    pub fn with_response(self) -> (IoRequest, UnboundedReceiver<ReceivedMessage>) {
-        let (chan, receiver) = unbounded();
-
-        let mut req = self.without_response();
-        req.chan = Some(chan);
-        (req, receiver)
     }
 }
