@@ -6,7 +6,6 @@ use crate::HashMap;
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
-use sqlx_core::statement::Statement;
 use worker::{IoRequest, MessageBuf, Pipe};
 
 use crate::common::StatementCache;
@@ -14,8 +13,8 @@ use crate::error::Error;
 use crate::ext::ustr::UStr;
 use crate::io::StatementId;
 use crate::message::{
-    BackendMessageFormat, Close, EncodeMessage, FrontendMessage, Notification, Query,
-    ReadyForQuery, ReceivedMessage, Terminate, TransactionStatus,
+    BackendMessageFormat, FrontendMessage, Notification, Query, ReadyForQuery, ReceivedMessage,
+    TransactionStatus,
 };
 use crate::statement::PgStatementMetadata;
 use crate::transaction::Transaction;
@@ -85,46 +84,6 @@ pub struct PgConnectionInner {
 }
 
 impl PgConnection {
-    // will return when the connection is ready for another query
-    pub(crate) async fn wait_until_ready(&mut self) -> Result<(), Error> {
-        if !self.inner.stream.write_buffer_mut().is_empty() {
-            self.inner.stream.flush().await?;
-        }
-
-        while self.inner.pending_ready_for_query_count > 0 {
-            let message = self.inner.stream.recv().await?;
-
-            if let BackendMessageFormat::ReadyForQuery = message.format {
-                self.handle_ready_for_query(message)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// the version number of the server in `libpq` format
-    async fn recv_ready_for_query(&mut self) -> Result<(), Error> {
-        let r: ReadyForQuery = self.inner.stream.recv_expect().await?;
-
-        self.inner.pending_ready_for_query_count -= 1;
-        self.inner.transaction_status = r.transaction_status;
-
-        Ok(())
-    }
-
-    #[inline(always)]
-    fn handle_ready_for_query(&mut self, message: ReceivedMessage) -> Result<(), Error> {
-        self.inner.pending_ready_for_query_count = self
-            .inner
-            .pending_ready_for_query_count
-            .checked_sub(1)
-            .ok_or_else(|| err_protocol!("received more ReadyForQuery messages than expected"))?;
-
-        self.inner.transaction_status = message.decode::<ReadyForQuery>()?.transaction_status;
-
-        Ok(())
-    }
-
     pub fn server_version_num(&self) -> Option<u32> {
         self.inner.server_version_num
     }

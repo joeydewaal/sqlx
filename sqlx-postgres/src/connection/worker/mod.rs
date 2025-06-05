@@ -146,7 +146,7 @@ impl Worker {
                 }
                 BackendMessageFormat::NoticeResponse | BackendMessageFormat::ParameterStatus => {
                     // Asynchronous response - todo
-                    dbg!(&response);
+                    // dbg!(&response);
                 }
                 _ => self.send_back(response)?,
             }

@@ -136,13 +136,13 @@ impl PgConnection {
 
         if persistent && self.inner.cache_statement.is_enabled() {
             if let Some((id, _)) = self.inner.cache_statement.insert(sql, statement.clone()) {
-                self.inner.stream.write_msg(Close::Statement(id))?;
-                // self.write_sync();
+                let mut pipe = self.pipe(|buf| {
+                    buf.write_msg(Close::Statement(id))?;
+                    Ok(buf.write_sync())
+                })?;
 
-                self.inner.stream.flush().await?;
-
-                // self.wait_for_close_complete(1).await?;
-                self.recv_ready_for_query().await?;
+                pipe.wait_for_close_complete(1).await?;
+                pipe.recv_ready_for_query().await?;
             }
         }
 

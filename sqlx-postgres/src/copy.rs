@@ -321,7 +321,6 @@ async fn pg_begin_copy_out<'c, C: DerefMut<Target = PgConnection> + Send + 'c>(
     mut conn: C,
     statement: &str,
 ) -> Result<BoxStream<'c, Result<Bytes>>> {
-    conn.wait_until_ready().await?;
     conn.inner.stream.send(Query(statement)).await?;
 
     let _: CopyOutResponse = conn.inner.stream.recv_expect().await?;
