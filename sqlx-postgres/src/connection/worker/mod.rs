@@ -121,7 +121,6 @@ impl Worker {
 
     #[inline(always)]
     fn send_back(&mut self, response: ReceivedMessage) -> Result<()> {
-        println!("sending response back {response:?}");
         if let Some(chan) = self.back_log.front_mut() {
             let _ = chan.unbounded_send(response);
             Ok(())

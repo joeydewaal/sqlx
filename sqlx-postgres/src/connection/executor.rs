@@ -5,7 +5,7 @@ use crate::io::{PortalId, StatementId};
 use crate::logger::QueryLogger;
 use crate::message::{
     self, BackendMessageFormat, Bind, Close, CommandComplete, DataRow, ParameterDescription, Parse,
-    ParseComplete, Query, RowDescription,
+    ParseComplete, RowDescription,
 };
 use crate::statement::PgStatementMetadata;
 use crate::{
@@ -159,6 +159,7 @@ impl PgConnection {
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
 
         let mut metadata: Arc<PgStatementMetadata>;
+        let mut pipe: Pipe;
 
         let format = if let Some(mut arguments) = arguments {
             // Check this before we write anything to the stream.
@@ -185,50 +186,49 @@ impl PgConnection {
             // patch holes created during encoding
             arguments.apply_patches(self, &metadata.parameters).await?;
 
-            // bind to attach the arguments to the statement and create a portal
-            self.inner.stream.write_msg(Bind {
-                portal: PortalId::UNNAMED,
-                statement,
-                formats: &[PgValueFormat::Binary],
-                num_params,
-                params: &arguments.buffer,
-                result_formats: &[PgValueFormat::Binary],
+            pipe = self.pipe(|buf| {
+                // bind to attach the arguments to the statement and create a portal
+                buf.write_msg(Bind {
+                    portal: PortalId::UNNAMED,
+                    statement,
+                    formats: &[PgValueFormat::Binary],
+                    num_params,
+                    params: &arguments.buffer,
+                    result_formats: &[PgValueFormat::Binary],
+                })?;
+
+                // executes the portal up to the passed limit
+                // the protocol-level limit acts nearly identically to the `LIMIT` in SQL
+                buf.write_msg(message::Execute {
+                    portal: PortalId::UNNAMED,
+                    // Non-zero limits cause query plan pessimization by disabling parallel workers:
+                    // https://github.com/launchbadge/sqlx/issues/3673
+                    limit: 0,
+                })?;
+                // From https://www.postgresql.org/docs/current/protocol-flow.html:
+                //
+                // "An unnamed portal is destroyed at the end of the transaction, or as
+                // soon as the next Bind statement specifying the unnamed portal as
+                // destination is issued. (Note that a simple Query message also
+                // destroys the unnamed portal."
+
+                // we ask the database server to close the unnamed portal and free the associated resources
+                // earlier - after the execution of the current query.
+                buf.write_msg(Close::Portal(PortalId::UNNAMED))?;
+
+                // finally, [Sync] asks postgres to process the messages that we sent and respond with
+                // a [ReadyForQuery] message when it's completely done. Theoretically, we could send
+                // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
+                // is still serial but it would reduce round-trips. Some kind of builder pattern that is
+                // termed batching might suit this.
+                Ok(buf.write_sync())
             })?;
-
-            // executes the portal up to the passed limit
-            // the protocol-level limit acts nearly identically to the `LIMIT` in SQL
-            self.inner.stream.write_msg(message::Execute {
-                portal: PortalId::UNNAMED,
-                // Non-zero limits cause query plan pessimization by disabling parallel workers:
-                // https://github.com/launchbadge/sqlx/issues/3673
-                limit: 0,
-            })?;
-            // From https://www.postgresql.org/docs/current/protocol-flow.html:
-            //
-            // "An unnamed portal is destroyed at the end of the transaction, or as
-            // soon as the next Bind statement specifying the unnamed portal as
-            // destination is issued. (Note that a simple Query message also
-            // destroys the unnamed portal."
-
-            // we ask the database server to close the unnamed portal and free the associated resources
-            // earlier - after the execution of the current query.
-            self.inner
-                .stream
-                .write_msg(Close::Portal(PortalId::UNNAMED))?;
-
-            // finally, [Sync] asks postgres to process the messages that we sent and respond with
-            // a [ReadyForQuery] message when it's completely done. Theoretically, we could send
-            // dozens of queries before a [Sync] and postgres can handle that. Execution on the server
-            // is still serial but it would reduce round-trips. Some kind of builder pattern that is
-            // termed batching might suit this.
-            // self.write_sync();
 
             // prepared statements are binary
             PgValueFormat::Binary
         } else {
             // Query will trigger a ReadyForQuery
-            self.inner.stream.write_msg(Query(query))?;
-            self.inner.pending_ready_for_query_count += 1;
+            pipe = self.queue_simple_query(query)?;
 
             // metadata starts out as "nothing"
             metadata = Arc::new(PgStatementMetadata::default());
@@ -237,11 +237,9 @@ impl PgConnection {
             PgValueFormat::Text
         };
 
-        self.inner.stream.flush().await?;
-
         Ok(try_stream! {
             loop {
-                let message = self.inner.stream.recv().await?;
+                let message = pipe.recv().await?;
 
                 match message.format {
                     BackendMessageFormat::BindComplete
@@ -273,7 +271,7 @@ impl PgConnection {
                         // empty query string passed to an unprepared execute
                     }
 
-                    // Message::ErrorResponse is handled in self.stream.recv()
+                    // Message::ErrorResponse is handled in pipe.recv()
 
                     // incomplete query execution has finished
                     BackendMessageFormat::PortalSuspended => {}
@@ -307,7 +305,6 @@ impl PgConnection {
 
                     BackendMessageFormat::ReadyForQuery => {
                         // processing of the query string is complete
-                        self.handle_ready_for_query(message)?;
                         break;
                     }
 
