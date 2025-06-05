@@ -77,7 +77,7 @@ pub struct PgConnectionInner {
 
     chan: UnboundedSender<IoRequest>,
 
-    notifications: UnboundedReceiver<Notification>,
+    pub(crate) notifications: UnboundedReceiver<Notification>,
 }
 
 impl PgConnection {

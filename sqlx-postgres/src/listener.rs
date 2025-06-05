@@ -1,8 +1,6 @@
 use std::fmt::{self, Debug};
-use std::io;
 use std::str::from_utf8;
 
-use futures_channel::mpsc;
 use futures_core::future::BoxFuture;
 use futures_core::stream::{BoxStream, Stream};
 use futures_util::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
@@ -14,7 +12,7 @@ use tracing::Instrument;
 use crate::describe::Describe;
 use crate::error::Error;
 use crate::executor::{Execute, Executor};
-use crate::message::{BackendMessageFormat, Notification};
+use crate::message::Notification;
 use crate::pool::PoolOptions;
 use crate::pool::{Pool, PoolConnection};
 use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgres};
@@ -28,8 +26,6 @@ use crate::{PgConnection, PgQueryResult, PgRow, PgStatement, PgTypeInfo, Postgre
 pub struct PgListener {
     pool: Pool<Postgres>,
     connection: Option<PoolConnection<Postgres>>,
-    buffer_rx: mpsc::UnboundedReceiver<Notification>,
-    buffer_tx: Option<mpsc::UnboundedSender<Notification>>,
     channels: Vec<String>,
     ignore_close_event: bool,
     eager_reconnect: bool,
@@ -58,17 +54,11 @@ impl PgListener {
 
     pub async fn connect_with(pool: &Pool<Postgres>) -> Result<Self, Error> {
         // Pull out an initial connection
-        let mut connection = pool.acquire().await?;
-
-        // Setup a notification buffer
-        let (sender, receiver) = mpsc::unbounded();
-        connection.inner.stream.notifications = Some(sender);
+        let connection = pool.acquire().await?;
 
         Ok(Self {
             pool: pool.clone(),
             connection: Some(connection),
-            buffer_rx: receiver,
-            buffer_tx: None,
             channels: Vec::new(),
             ignore_close_event: false,
             eager_reconnect: true,
@@ -173,7 +163,6 @@ impl PgListener {
     async fn connect_if_needed(&mut self) -> Result<(), Error> {
         if self.connection.is_none() {
             let mut connection = self.pool.acquire().await?;
-            connection.inner.stream.notifications = self.buffer_tx.take();
 
             connection
                 .execute(&*build_listen_all_query(&self.channels))
@@ -264,7 +253,7 @@ impl PgListener {
         let mut close_event = (!self.ignore_close_event).then(|| self.pool.close_event());
 
         loop {
-            let next_message = self.connection().await?.inner.stream.recv_unchecked();
+            let next_message = self.connection().await?.inner.notifications.next();
 
             let res = if let Some(ref mut close_event) = close_event {
                 // cancels the wait and returns `Err(PoolClosed)` if the pool is closed
@@ -275,22 +264,12 @@ impl PgListener {
             };
 
             let message = match res {
-                Ok(message) => message,
+                Some(message) => message,
 
                 // The connection is dead, ensure that it is dropped,
                 // update self state, and loop to try again.
-                Err(Error::Io(err))
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::ConnectionAborted |
-                        io::ErrorKind::UnexpectedEof |
-                        // see ERRORS section in tcp(7) man page (https://man7.org/linux/man-pages/man7/tcp.7.html)
-                        io::ErrorKind::TimedOut |
-                        io::ErrorKind::BrokenPipe
-                    ) =>
-                {
+                None => {
                     if let Some(mut conn) = self.connection.take() {
-                        self.buffer_tx = conn.inner.stream.notifications.take();
                         // Close the connection in a background task, so we can continue.
                         conn.close_on_drop();
                     }
@@ -302,27 +281,9 @@ impl PgListener {
                     // lost connection
                     return Ok(None);
                 }
-
-                // Forward other errors
-                Err(error) => {
-                    return Err(error);
-                }
             };
 
-            match message.format {
-                // We've received an async notification, return it.
-                BackendMessageFormat::NotificationResponse => {
-                    return Ok(Some(PgNotification(message.decode()?)));
-                }
-
-                // Mark the connection as ready for another query
-                BackendMessageFormat::ReadyForQuery => {
-                    self.connection().await?.inner.pending_ready_for_query_count -= 1;
-                }
-
-                // Ignore unexpected messages
-                _ => {}
-            }
+            return Ok(Some(PgNotification(message)));
         }
     }
 
@@ -332,7 +293,7 @@ impl PgListener {
     ///
     /// This is helpful if you want to retrieve all buffered notifications and process them in batches.
     pub fn next_buffered(&mut self) -> Option<PgNotification> {
-        if let Ok(Some(notification)) = self.buffer_rx.try_next() {
+        if let Ok(Some(notification)) = self.connection.as_mut()?.inner.notifications.try_next() {
             Some(PgNotification(notification))
         } else {
             None
