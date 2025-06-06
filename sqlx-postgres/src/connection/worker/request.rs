@@ -1,4 +1,4 @@
-use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures_channel::mpsc::UnboundedSender;
 use sqlx_core::{io::ProtocolEncode, Error};
 
 use crate::message::{self, EncodeMessage, FrontendMessage, ReceivedMessage};

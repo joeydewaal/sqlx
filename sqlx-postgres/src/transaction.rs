@@ -31,7 +31,7 @@ impl TransactionManager for PgTransactionManager {
 
             let rollback = Rollback::new(conn);
             let mut pipe = rollback.conn.queue_simple_query(&statement)?;
-            pipe.recv_ready_for_query().await?;
+            pipe.wait_ready_for_query().await?;
             if !rollback.conn.in_transaction() {
                 return Err(Error::BeginFailed);
             }

@@ -184,6 +184,8 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
         (3, 0, 0),
     ];
 
+    println!("here");
+
     for (id, before_acquire_calls, after_release_calls) in pattern {
         let conn_stats: ConnStats = sqlx::query_as("SELECT * FROM conn_stats")
             .fetch_one(&pool)
@@ -198,8 +200,11 @@ async fn test_pool_callbacks() -> anyhow::Result<()> {
             }
         );
     }
+    println!("here");
 
     pool.close().await;
+
+    println!("here");
 
     Ok(())
 }

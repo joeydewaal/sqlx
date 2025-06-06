@@ -6,7 +6,8 @@ use std::{
 };
 
 use crate::message::{
-    BackendMessageFormat, FrontendMessage, Notification, ReceivedMessage, Terminate,
+    BackendMessageFormat, FrontendMessage, Notice, Notification, ParameterStatus, ReadyForQuery,
+    ReceivedMessage, Terminate,
 };
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_util::{SinkExt, StreamExt};
@@ -16,13 +17,15 @@ use sqlx_core::{
     Result,
 };
 
-use super::{codec::PostgresCodec, PgStream};
+use super::{codec::PostgresCodec, stream::parse_server_version, PgStream};
 
 mod pipe;
 mod request;
+mod shared;
 
 pub use pipe::Pipe;
 pub use request::{IoRequest, MessageBuf};
+pub use shared::Shared;
 
 #[derive(PartialEq, Debug)]
 enum WorkerState {
@@ -42,12 +45,14 @@ pub struct Worker {
     back_log: VecDeque<UnboundedSender<ReceivedMessage>>,
     socket: Framed<Box<dyn Socket>, PostgresCodec>,
     notif_chan: UnboundedSender<Notification>,
+    shared: Shared,
 }
 
 impl Worker {
     pub fn spawn(
         stream: PgStream,
         notif_chan: UnboundedSender<Notification>,
+        shared: Shared,
     ) -> UnboundedSender<IoRequest> {
         let (tx, rx) = unbounded();
 
@@ -58,6 +63,7 @@ impl Worker {
             back_log: VecDeque::new(),
             socket: stream.into_inner(),
             notif_chan,
+            shared,
         };
 
         spawn(worker);
@@ -104,7 +110,10 @@ impl Worker {
 
             if let Some(chan) = request.chan {
                 // We should send the responses back
+                println!("got request with response");
                 self.back_log.push_back(chan);
+            } else {
+                println!("got request without response");
             }
         }
     }
@@ -121,6 +130,7 @@ impl Worker {
 
     #[inline(always)]
     fn send_back(&mut self, response: ReceivedMessage) -> Result<()> {
+        println!("sending back {:?}", response.format);
         if let Some(chan) = self.back_log.front_mut() {
             let _ = chan.unbounded_send(response);
             Ok(())
@@ -133,7 +143,15 @@ impl Worker {
     fn poll_backlog(&mut self, cx: &mut Context<'_>) -> Result<()> {
         while let Some(response) = self.poll_next_message(cx)? {
             match response.format {
-                BackendMessageFormat::CopyInResponse | BackendMessageFormat::ReadyForQuery => {
+                BackendMessageFormat::ReadyForQuery => {
+                    let rfq: ReadyForQuery = response.clone().decode()?;
+                    self.shared.set_transaction_status(rfq.transaction_status);
+                    self.send_back(response)?;
+                    // Remove from the backlog so we dont send more responses back.
+                    println!("done");
+                    let _ = self.back_log.pop_front();
+                }
+                BackendMessageFormat::CopyInResponse => {
                     // End of response
                     self.send_back(response)?;
                     // Remove from the backlog so we dont send more responses back.
@@ -144,9 +162,27 @@ impl Worker {
                     let notif: Notification = response.decode()?;
                     let _ = self.notif_chan.unbounded_send(notif);
                 }
-                BackendMessageFormat::NoticeResponse | BackendMessageFormat::ParameterStatus => {
-                    // Asynchronous response - todo
-                    // dbg!(&response);
+                BackendMessageFormat::ParameterStatus => {
+                    // Asynchronous response
+                    let ParameterStatus { name, value } = response.decode()?;
+                    // TODO: handle `client_encoding`, `DateStyle` change
+
+                    match name.as_str() {
+                        "server_version" => {
+                            self.shared
+                                .set_server_version_num(parse_server_version(&value));
+                        }
+                        _ => {
+                            self.shared.insert_parameter_status(name, value);
+                        }
+                    }
+
+                    continue;
+                }
+                BackendMessageFormat::NoticeResponse => {
+                    // Asynchronous response
+                    let notice: Notice = response.decode()?;
+                    notice.emit_notice();
                 }
                 _ => self.send_back(response)?,
             }

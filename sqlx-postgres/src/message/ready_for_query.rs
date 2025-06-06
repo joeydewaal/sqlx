@@ -3,10 +3,11 @@ use sqlx_core::bytes::Bytes;
 use crate::error::Error;
 use crate::message::{BackendMessage, BackendMessageFormat};
 
-#[derive(Debug)]
+#[derive(Debug, Default, Clone, Copy)]
 #[repr(u8)]
 pub enum TransactionStatus {
     /// Not in a transaction block.
+    #[default]
     Idle = b'I',
 
     /// In a transaction block.

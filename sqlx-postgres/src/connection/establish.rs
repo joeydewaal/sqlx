@@ -7,7 +7,7 @@ use crate::message::{
 };
 use crate::{PgConnectOptions, PgConnection};
 
-use super::worker::Worker;
+use super::worker::{Shared, Worker};
 
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.3
 // https://www.postgresql.org/docs/current/protocol-flow.html#id-1.10.5.7.11
@@ -16,14 +16,14 @@ impl PgConnection {
     pub(crate) async fn establish(options: &PgConnectOptions) -> Result<Self, Error> {
         // Upgrade to TLS if we were asked to and the server supports it
         let stream = PgStream::connect(options).await?;
-        let pg_stream = PgStream::connect(options).await?;
 
         let (notif_tx, notif_rx) = unbounded();
 
+        let shared = Shared::new();
         // Spawn the background worker.
-        let worker_tx = Worker::spawn(stream, notif_tx);
+        let worker_tx = Worker::spawn(stream, notif_tx, shared.clone());
 
-        let mut conn = PgConnection::new(options, worker_tx, notif_rx, pg_stream);
+        let mut conn = PgConnection::new(options, worker_tx, notif_rx, shared);
 
         let mut params = vec![
             // Sets the display format for date and time values,
@@ -138,8 +138,9 @@ impl PgConnection {
 
         conn.inner.process_id = process_id;
         conn.inner.secret_key = secret_key;
-        conn.inner.transaction_status = transaction_status;
+        conn.inner.shared.set_transaction_status(transaction_status);
 
+        println!("established");
         Ok(conn)
     }
 }

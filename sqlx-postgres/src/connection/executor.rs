@@ -156,6 +156,7 @@ impl PgConnection {
         persistent: bool,
         metadata_opt: Option<Arc<PgStatementMetadata>>,
     ) -> Result<impl Stream<Item = Result<Either<PgQueryResult, PgRow>, Error>> + 'e, Error> {
+        println!("EXEC: {query:?}");
         let mut logger = QueryLogger::new(query, self.inner.log_settings.clone());
 
         let mut metadata: Arc<PgStatementMetadata>;
