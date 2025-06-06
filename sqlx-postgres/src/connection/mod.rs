@@ -27,6 +27,7 @@ pub use self::stream::PgStream;
 mod describe;
 mod establish;
 mod executor;
+mod pipe;
 mod request;
 mod resolve;
 mod sasl;
