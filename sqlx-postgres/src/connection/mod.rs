@@ -30,7 +30,6 @@ mod pipe;
 mod request;
 mod resolve;
 mod sasl;
-mod stream;
 mod tls;
 mod worker;
 
