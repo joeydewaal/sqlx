@@ -40,6 +40,7 @@ pub struct PgConnection {
 }
 
 pub struct PgConnectionInner {
+    // channel to the background worker
     chan: UnboundedSender<IoRequest>,
 
     pub(crate) notifications: UnboundedReceiver<Notification>,
