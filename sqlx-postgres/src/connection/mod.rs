@@ -29,7 +29,6 @@ mod executor;
 mod pipe;
 mod request;
 mod sasl;
-mod stream;
 mod tls;
 mod worker;
 
