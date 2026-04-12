@@ -312,6 +312,7 @@ impl Shared {
         self.lock().parameter_statuses.remove(name)
     }
 
+    #[cfg(feature = "offline")]
     pub fn with_lock<T>(&self, f: impl Fn(&mut SharedInner) -> T) -> T {
         let mut lock = self.lock();
         f(&mut lock)
